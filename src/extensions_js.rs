@@ -8899,7 +8899,197 @@ export function isContextOverflow(message, contextWindow) {
   }
 }
 
-export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken, isContextOverflow };
+// pi-agent-core `Agent`. `@earendil-works/pi-agent-core` resolves to this
+// module, and pi-subagents imports `Agent` statically (watchdog review,
+// permission arbiter, prompt audit), so a missing export is a link error that
+// drops the whole extension at load — the same failure shape as
+// DefaultPackageManager (gh #223). This is the upstream loop, reduced to what
+// callers observe: prompt() streams through `streamFn` (or this module's
+// streamSimple), gates tool calls with `beforeToolCall`, runs `tool.execute`,
+// and appends every message to `state.messages`. A stream failure lands as an
+// assistant message with stopReason "error" exactly as upstream does; nothing
+// is fabricated. Not carried: steering/follow-up queues, transformContext.
+function __piAgentToolResultMessage(toolCall, content, details, isError) {
+  return {
+    role: "toolResult",
+    toolCallId: toolCall.id,
+    toolName: toolCall.name,
+    content,
+    details,
+    isError,
+    timestamp: Date.now(),
+  };
+}
+
+export class Agent {
+  constructor(opts = {}) {
+    const init = opts.initialState && typeof opts.initialState === "object" ? opts.initialState : {};
+    this.state = {
+      systemPrompt: typeof init.systemPrompt === "string" ? init.systemPrompt : "",
+      model: init.model,
+      thinkingLevel: init.thinkingLevel || "off",
+      tools: Array.isArray(init.tools) ? init.tools : [],
+      messages: Array.isArray(init.messages) ? init.messages.slice() : [],
+      isStreaming: false,
+      streamMessage: null,
+      pendingToolCalls: new Set(),
+      error: undefined,
+    };
+    this.streamFn = opts.streamFn || opts.streamFunction || streamSimple;
+    this.convertToLlm = typeof opts.convertToLlm === "function" ? opts.convertToLlm : (messages) => messages;
+    this.getApiKey = opts.getApiKey;
+    this.beforeToolCall = opts.beforeToolCall;
+    this.sessionId = opts.sessionId;
+    this.__listeners = new Set();
+    this.__abortController = null;
+    this.__running = null;
+  }
+
+  subscribe(listener) {
+    this.__listeners.add(listener);
+    return () => { this.__listeners.delete(listener); };
+  }
+
+  __emit(event) {
+    for (const listener of Array.from(this.__listeners)) {
+      try { listener(event); } catch (_) { /* listener errors never break the loop */ }
+    }
+  }
+
+  __append(message) {
+    this.state.messages.push(message);
+    this.__emit({ type: "message_start", message });
+    this.__emit({ type: "message_end", message });
+  }
+
+  abort() {
+    if (this.__abortController) this.__abortController.abort();
+  }
+
+  waitForIdle() {
+    return this.__running ? this.__running : Promise.resolve();
+  }
+
+  async prompt(input) {
+    const incoming = typeof input === "string"
+      ? [{ role: "user", content: input, timestamp: Date.now() }]
+      : Array.isArray(input) ? input : [input];
+    return this.__start(incoming);
+  }
+
+  async continue() {
+    return this.__start([]);
+  }
+
+  async __start(incoming) {
+    if (this.__running) throw new Error("Agent is already processing a prompt");
+    this.__running = this.__run(incoming);
+    try {
+      await this.__running;
+    } finally {
+      this.__running = null;
+    }
+  }
+
+  async __run(incoming) {
+    const model = this.state.model;
+    if (!model) throw new Error("No model configured");
+    this.__abortController = new AbortController();
+    const signal = this.__abortController.signal;
+    this.state.isStreaming = true;
+    this.state.streamMessage = null;
+    this.state.error = undefined;
+    this.__emit({ type: "agent_start" });
+    try {
+      for (const message of incoming) this.__append(message);
+      while (true) {
+        this.__emit({ type: "turn_start" });
+        const assistant = await this.__streamAssistant(model, signal);
+        const toolCalls = Array.isArray(assistant.content)
+          ? assistant.content.filter((block) => block && block.type === "toolCall")
+          : [];
+        const toolResults = [];
+        if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted" && toolCalls.length > 0) {
+          for (const toolCall of toolCalls) {
+            toolResults.push(await this.__executeTool(assistant, toolCall, signal));
+            if (signal.aborted) break;
+          }
+        }
+        this.__emit({ type: "turn_end", message: assistant, toolResults });
+        if (toolResults.length === 0 || signal.aborted) break;
+      }
+    } finally {
+      this.state.isStreaming = false;
+      this.state.streamMessage = null;
+      this.__emit({ type: "agent_end", messages: this.state.messages.slice() });
+    }
+  }
+
+  async __streamAssistant(model, signal) {
+    const llmMessages = await this.convertToLlm(this.state.messages.slice());
+    const context = { systemPrompt: this.state.systemPrompt, messages: llmMessages, tools: this.state.tools };
+    let message;
+    try {
+      const apiKey = this.getApiKey ? await this.getApiKey(model.provider) : undefined;
+      const reasoning = this.state.thinkingLevel === "off" ? undefined : this.state.thinkingLevel;
+      if (signal.aborted) throw new Error("aborted");
+      const response = await this.streamFn(model, context, { apiKey, reasoning, signal, sessionId: this.sessionId });
+      if (response && typeof response[Symbol.asyncIterator] === "function") {
+        for await (const event of response) {
+          if (event && event.partial) {
+            this.state.streamMessage = event.partial;
+            this.__emit({ type: "message_update", message: event.partial, assistantMessageEvent: event });
+          }
+          if (event && (event.type === "done" || event.type === "error")) break;
+        }
+      }
+      message = response && typeof response.result === "function" ? await response.result() : response;
+      if (!message || typeof message !== "object" || message.role !== "assistant") {
+        throw new Error("Agent: streamFn must yield an AssistantMessage");
+      }
+    } catch (error) {
+      message = assistantMessageFor(model, "", {});
+      message.stopReason = signal.aborted ? "aborted" : "error";
+      message.errorMessage = String((error && error.message) || error || "");
+      this.state.error = message.errorMessage;
+    }
+    this.state.streamMessage = null;
+    this.__append(message);
+    return message;
+  }
+
+  async __executeTool(assistantMessage, toolCall, signal) {
+    const args = toolCall.arguments;
+    this.state.pendingToolCalls.add(toolCall.id);
+    this.__emit({ type: "tool_execution_start", toolCallId: toolCall.id, toolName: toolCall.name, args });
+    let result;
+    let isError = false;
+    try {
+      const gate = this.beforeToolCall ? await this.beforeToolCall({ assistantMessage, toolCall, args }, signal) : undefined;
+      if (gate && gate.block) {
+        throw new Error(gate.reason || `Tool call ${toolCall.name} blocked`);
+      }
+      const tool = this.state.tools.find((candidate) => candidate && candidate.name === toolCall.name);
+      if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
+      result = await tool.execute(toolCall.id, args, signal, (partialResult) => {
+        this.__emit({ type: "tool_execution_update", toolCallId: toolCall.id, toolName: toolCall.name, args, partialResult });
+      });
+      if (!result || typeof result !== "object" || !Array.isArray(result.content)) {
+        throw new Error(`Tool ${toolCall.name} returned no content`);
+      }
+    } catch (error) {
+      result = { content: [{ type: "text", text: String((error && error.message) || error || "") }], details: {} };
+      isError = true;
+    }
+    this.state.pendingToolCalls.delete(toolCall.id);
+    this.__emit({ type: "tool_execution_end", toolCallId: toolCall.id, toolName: toolCall.name, result, isError });
+    const toolResult = __piAgentToolResultMessage(toolCall, result.content, result.details, isError);
+    this.__append(toolResult);
+    return toolResult;
+  }
+}
+
+export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken, isContextOverflow, Agent };
 "#)
         .trim()
         .to_string(),
@@ -11907,6 +12097,18 @@ export default { createRequire };
         compressed_js_literal!(r#"
 import { Readable, Writable } from "node:stream";
 
+// Node fs errors carry `code` ("ENOENT", "EEXIST", ...) and callers branch on
+// it (`if (error.code === "ENOENT") return []`). A bare Error with the code
+// only in its message defeats every such check, so every throw below goes
+// through here. The message keeps Node's "ECODE: description, syscall 'path'"
+// shape; the code is lifted from its prefix.
+function __pi_fs_error(message) {
+  const error = new Error(message);
+  const match = /^(E[A-Z]+):/.exec(message);
+  if (match) error.code = match[1];
+  return error;
+}
+
 export const constants = {
   R_OK: 4,
   W_OK: 2,
@@ -12116,7 +12318,7 @@ const __pi_vfs = (() => {
     for (const part of parts) {
       current = current ? `${current}/${part}` : `/${part}`;
       if (state.files.has(current) || state.symlinks.has(current)) {
-        throw new Error(`ENOTDIR: not a directory, mkdir '${String(path ?? "")}'`);
+        throw __pi_fs_error(`ENOTDIR: not a directory, mkdir '${String(path ?? "")}'`);
       }
       state.dirs.add(current);
     }
@@ -12314,7 +12516,7 @@ const __pi_vfs = (() => {
       const component = firstSymlinkComponent(normalized);
       if (!component) break;
       if (seen.has(component.linkPath) || seen.size >= 40) {
-        throw new Error(`ELOOP: too many symbolic links encountered, stat '${String(path ?? "")}'`);
+        throw __pi_fs_error(`ELOOP: too many symbolic links encountered, stat '${String(path ?? "")}'`);
       }
       seen.add(component.linkPath);
       authorizationPaths.push(component.linkPath);
@@ -12403,14 +12605,14 @@ const __pi_vfs = (() => {
       case "ax+":
         return { readable: true, writable: true, append: true, create: true, truncate: false, exclusive: true };
       default:
-        throw new Error(`EINVAL: invalid open flags '${normalized}'`);
+        throw __pi_fs_error(`EINVAL: invalid open flags '${normalized}'`);
     }
   }
 
   function getFdEntry(fd) {
     const entry = state.fds.get(fd);
     if (!entry) {
-      throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+      throw __pi_fs_error(`EBADF: bad file descriptor, fd ${String(fd)}`);
     }
     return entry;
   }
@@ -12537,7 +12739,7 @@ const __pi_vfs = (() => {
     const isHostOther = hostKind === "other";
     const isFile = bytes !== undefined || isHostFile;
     if (!isDir && !isHostDir && !isFile && !isHostSymlink && !isHostOther) {
-      throw new Error(`ENOENT: no such file or directory, stat '${String(path ?? "")}'`);
+      throw __pi_fs_error(`ENOENT: no such file or directory, stat '${String(path ?? "")}'`);
     }
     const hostSize =
       hostStat && typeof hostStat.size === "number" && Number.isFinite(hostStat.size)
@@ -12717,7 +12919,7 @@ export function readFileSync(path, encoding) {
   }
   if (bytes === undefined) {
     const detail = hostError ? ` (host: ${hostError})` : "";
-    throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
+    throw __pi_fs_error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
   }
   return __pi_vfs.decodeBytes(bytes, encoding);
 }
@@ -12737,12 +12939,27 @@ export function appendFileSync(path, data, opts) {
 }
 
 export function writeFileSync(path, data, opts) {
+  // Node honours `flag` here ("wx" = create-exclusive, "a" = append, ...).
+  // Anything but the default "w" goes through the descriptor path, which
+  // already implements every flag; "wx" in particular is how callers claim a
+  // lock file, so silently overwriting it would break their mutual exclusion.
+  const flag = opts && typeof opts === "object" && typeof opts.flag === "string" ? opts.flag : "w";
+  if (flag !== "w") {
+    const fd = openSync(path, flag, opts && typeof opts === "object" ? opts.mode : undefined);
+    try {
+      const next = __pi_vfs.toBytes(data, opts);
+      writeSync(fd, next, 0, next.byteLength, null);
+    } finally {
+      closeSync(fd);
+    }
+    return;
+  }
   const resolved = __pi_vfs.resolvePathForWrite(path, true);
   if (
     __pi_vfs.dirs.has(resolved) ||
     __pi_vfs.readHostStat(resolved, true)?.kind === "dir"
   ) {
-    throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
+    throw __pi_fs_error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
   }
   __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
   __pi_vfs.files.set(resolved, __pi_vfs.toBytes(data, opts));
@@ -12790,7 +13007,7 @@ export function readdirSync(path, opts) {
 
   if (!foundDir) {
     const detail = hostError ? ` (host: ${hostError})` : "";
-    throw new Error(`ENOENT: no such file or directory, scandir '${String(path ?? "")}'${detail}`);
+    throw __pi_fs_error(`ENOENT: no such file or directory, scandir '${String(path ?? "")}'${detail}`);
   }
 
   const names = Array.from(children.keys()).sort();
@@ -12827,13 +13044,17 @@ export function realpathSync(path, _opts) {
   const resolved = __pi_vfs.resolvePathForRead(path, true);
   return __pi_vfs.unmapExtensionTempPath(resolved);
 }
+// Node exposes the libc-backed variant as `fs.realpathSync.native`; here
+// there is only one resolver, so it is the same function. pi-subagents calls
+// the .native form when walking for project roots.
+realpathSync.native = realpathSync;
 export function unlinkSync(path) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
   if (__pi_vfs.symlinks.delete(normalized)) {
     return;
   }
   if (!__pi_vfs.files.delete(normalized)) {
-    throw new Error(`ENOENT: no such file or directory, unlink '${String(path ?? "")}'`);
+    throw __pi_fs_error(`ENOENT: no such file or directory, unlink '${String(path ?? "")}'`);
   }
 }
 export function rmdirSync(path, _opts) {
@@ -12842,26 +13063,26 @@ export function rmdirSync(path, _opts) {
     throw new Error("EBUSY: resource busy or locked, rmdir '/'");
   }
   if (__pi_vfs.symlinks.has(normalized)) {
-    throw new Error(`ENOTDIR: not a directory, rmdir '${String(path ?? "")}'`);
+    throw __pi_fs_error(`ENOTDIR: not a directory, rmdir '${String(path ?? "")}'`);
   }
   __pi_vfs.authorizeTreeWrite(normalized);
   for (const filePath of __pi_vfs.files.keys()) {
     if (filePath.startsWith(`${normalized}/`)) {
-      throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
+      throw __pi_fs_error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
   for (const dirPath of __pi_vfs.dirs) {
     if (dirPath.startsWith(`${normalized}/`)) {
-      throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
+      throw __pi_fs_error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
   for (const linkPath of __pi_vfs.symlinks.keys()) {
     if (linkPath.startsWith(`${normalized}/`)) {
-      throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
+      throw __pi_fs_error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
   if (!__pi_vfs.dirs.delete(normalized)) {
-    throw new Error(`ENOENT: no such file or directory, rmdir '${String(path ?? "")}'`);
+    throw __pi_fs_error(`ENOENT: no such file or directory, rmdir '${String(path ?? "")}'`);
   }
 }
 export function rmSync(path, opts) {
@@ -12901,7 +13122,10 @@ export function rmSync(path, opts) {
     }
     return;
   }
-  throw new Error(`ENOENT: no such file or directory, rm '${String(path ?? "")}'`);
+  // Node: { force: true } ignores a missing target (the atomic write-then-
+  // rename idiom relies on it to clean up an already-renamed temp file).
+  if (opts && typeof opts === "object" && opts.force) return;
+  throw __pi_fs_error(`ENOENT: no such file or directory, rm '${String(path ?? "")}'`);
 }
 export function copyFileSync(src, dest, _mode) {
   writeFileSync(dest, readFileSync(src));
@@ -12923,12 +13147,12 @@ export function renameSync(oldPath, newPath) {
     __pi_vfs.files.delete(src);
     return;
   }
-  throw new Error(`ENOENT: no such file or directory, rename '${String(oldPath ?? "")}'`);
+  throw __pi_fs_error(`ENOENT: no such file or directory, rename '${String(oldPath ?? "")}'`);
 }
 export function mkdirSync(path, _opts) {
   const resolved = __pi_vfs.resolvePathForWrite(path, true);
   if (__pi_vfs.files.has(resolved) || __pi_vfs.symlinks.has(resolved)) {
-    throw new Error(`EEXIST: file already exists, mkdir '${String(path ?? "")}'`);
+    throw __pi_fs_error(`EEXIST: file already exists, mkdir '${String(path ?? "")}'`);
   }
   __pi_vfs.ensureDir(resolved);
   return __pi_vfs.normalizePath(path);
@@ -12938,7 +13162,7 @@ export function accessSync(path, mode = constants.F_OK) {
     __pi_vfs.resolvePathForWrite(path, true);
   }
   if (!existsSync(path)) {
-    throw new Error("ENOENT: no such file or directory");
+    throw __pi_fs_error(`ENOENT: no such file or directory, access '${String(path ?? "")}'`);
   }
 }
 export function chmodSync(path, _mode) {
@@ -12957,9 +13181,9 @@ export function readlinkSync(path, opts) {
   const normalized = __pi_vfs.resolvePathForRead(path, false);
   if (!__pi_vfs.symlinks.has(normalized)) {
     if (__pi_vfs.files.has(normalized) || __pi_vfs.dirs.has(normalized)) {
-      throw new Error(`EINVAL: invalid argument, readlink '${String(path ?? "")}'`);
+      throw __pi_fs_error(`EINVAL: invalid argument, readlink '${String(path ?? "")}'`);
     }
-    throw new Error(`ENOENT: no such file or directory, readlink '${String(path ?? "")}'`);
+    throw __pi_fs_error(`ENOENT: no such file or directory, readlink '${String(path ?? "")}'`);
   }
   const target = String(__pi_vfs.symlinks.get(normalized));
   const encoding =
@@ -12977,10 +13201,10 @@ export function symlinkSync(target, path, _type) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
   const parent = __pi_vfs.dirname(normalized);
   if (!__pi_vfs.dirs.has(parent)) {
-    throw new Error(`ENOENT: no such file or directory, symlink '${String(path ?? "")}'`);
+    throw __pi_fs_error(`ENOENT: no such file or directory, symlink '${String(path ?? "")}'`);
   }
   if (__pi_vfs.files.has(normalized) || __pi_vfs.dirs.has(normalized) || __pi_vfs.symlinks.has(normalized)) {
-    throw new Error(`EEXIST: file already exists, symlink '${String(path ?? "")}'`);
+    throw __pi_fs_error(`EEXIST: file already exists, symlink '${String(path ?? "")}'`);
   }
   __pi_vfs.symlinks.set(normalized, String(target ?? ""));
 }
@@ -12999,7 +13223,7 @@ export function openSync(path, flags = "r", _mode) {
 
   const hostStat = __pi_vfs.readHostStat(resolved, true);
   if (__pi_vfs.dirs.has(resolved) || hostStat?.kind === "dir") {
-    throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
+    throw __pi_fs_error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
   }
 
   const existsInVfs = __pi_vfs.files.has(resolved);
@@ -13008,17 +13232,17 @@ export function openSync(path, flags = "r", _mode) {
   const exists = existsInVfs || existsOnHost;
   if (!exists && !opts.create) {
     const detail = host.error ? ` (host: ${host.error})` : "";
-    throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
+    throw __pi_fs_error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
   }
   if (exists && opts.create && opts.exclusive) {
-    throw new Error(`EEXIST: file already exists, open '${String(path ?? "")}'`);
+    throw __pi_fs_error(`EEXIST: file already exists, open '${String(path ?? "")}'`);
   }
   if (existsOnHost && hostStat.kind !== "file") {
-    throw new Error(`EINVAL: unsupported host file type, open '${String(path ?? "")}'`);
+    throw __pi_fs_error(`EINVAL: unsupported host file type, open '${String(path ?? "")}'`);
   }
   if (!existsInVfs && existsOnHost && host.bytes === undefined && !opts.truncate) {
     const detail = host.error ? `: ${host.error}` : "";
-    throw new Error(`EIO: unable to read host file '${String(path ?? "")}'${detail}`);
+    throw __pi_fs_error(`EIO: unable to read host file '${String(path ?? "")}'${detail}`);
   }
   if (!exists && opts.create) {
     __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
@@ -13065,7 +13289,7 @@ export function closeSync(fd) {
 export function readSync(fd, buffer, offset = 0, length, position = null) {
   const entry = __pi_vfs.getFdEntry(fd);
   if (!entry.readable) {
-    throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+    throw __pi_fs_error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
   __pi_vfs.authorizeFdRead(entry);
   const out = __pi_vfs.toWritableView(buffer);
@@ -13092,7 +13316,7 @@ export function readSync(fd, buffer, offset = 0, length, position = null) {
 export function writeSync(fd, buffer, offset, length, position) {
   const entry = __pi_vfs.getFdEntry(fd);
   if (!entry.writable) {
-    throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+    throw __pi_fs_error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
   __pi_vfs.authorizeFdWrite(entry);
 
@@ -13158,7 +13382,7 @@ export function fstatSync(fd) {
 export function ftruncateSync(fd, len = 0) {
   const entry = __pi_vfs.getFdEntry(fd);
   if (!entry.writable) {
-    throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+    throw __pi_fs_error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
   __pi_vfs.authorizeFdWrite(entry);
   const targetLen =
@@ -13183,7 +13407,7 @@ export function truncateSync(path, len = 0) {
 export function futimesSync(fd, _atime, _mtime) {
   const entry = __pi_vfs.getFdEntry(fd);
   if (!entry.writable) {
-    throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+    throw __pi_fs_error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
   __pi_vfs.authorizeFdWrite(entry);
 }
@@ -13475,7 +13699,7 @@ function makeFileHandle(fd) {
   let closed = false;
   const requireOpen = () => {
     if (closed || __pi_vfs.fds.get(fd) !== fdEntry) {
-      throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+      throw __pi_fs_error(`EBADF: bad file descriptor, fd ${String(fd)}`);
     }
     return fdEntry;
   };
@@ -20541,6 +20765,7 @@ const __pi_event_bus_index = new Map(); // event_name -> [{ extensionId, handler
 const __pi_provider_index = new Map();  // provider_id -> { extensionId, spec }
 const __pi_shortcut_index = new Map();  // key_id -> { extensionId, key, description, handler }
 const __pi_message_renderer_index = new Map(); // customType -> { extensionId, customType, renderer }
+const __pi_entry_renderer_index = new Map(); // entry customType -> { extensionId, customType, renderer }
 const __pi_mcp_server_index = new Map(); // server_name -> { extensionId, spec }
 
 // gh #167 extension-API parity: host session identity mirror + current system
@@ -20549,7 +20774,7 @@ const __pi_mcp_server_index = new Map(); // server_name -> { extensionId, spec }
 // surface real values; `__pi_current_system_prompt` backs ctx.getSystemPrompt()
 // and is captured from before_agent_start payloads (and, when present, from
 // a `systemPrompt` field on the host ctx payload).
-const __pi_session_identity = { id: null, file: null, dir: null };
+const __pi_session_identity = { id: null, file: null, dir: null, name: null };
 Object.defineProperty(globalThis, '__pi_session_identity', {
     value: __pi_session_identity,
     writable: false,
@@ -20645,6 +20870,7 @@ function __pi_runtime_registry_snapshot() {
         providers: __pi_map_size_primordial(__pi_provider_index),
         shortcuts: __pi_map_size_primordial(__pi_shortcut_index),
         messageRenderers: __pi_map_size_primordial(__pi_message_renderer_index),
+        entryRenderers: __pi_map_size_primordial(__pi_entry_renderer_index),
         mcpServers: __pi_map_size_primordial(__pi_mcp_server_index),
         pendingTasks: __pi_map_size_primordial(__pi_tasks),
         pendingHostcalls: __pi_map_size_primordial(__pi_pending_hostcalls),
@@ -20718,6 +20944,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
     __pi_map_clear_primordial(__pi_provider_index);
     __pi_map_clear_primordial(__pi_shortcut_index);
     __pi_map_clear_primordial(__pi_message_renderer_index);
+    __pi_map_clear_primordial(__pi_entry_renderer_index);
     __pi_map_clear_primordial(__pi_mcp_server_index);
     __pi_map_clear_primordial(__pi_tasks);
     __pi_map_clear_primordial(__pi_pending_hostcalls);
@@ -20727,6 +20954,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
     __pi_session_identity.id = null;
     __pi_session_identity.file = null;
     __pi_session_identity.dir = null;
+    __pi_session_identity.name = null;
     __pi_current_system_prompt = null;
 
     const after = __pi_runtime_registry_snapshot();
@@ -20739,6 +20967,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
         after.providers === 0 &&
         after.shortcuts === 0 &&
         after.messageRenderers === 0 &&
+        after.entryRenderers === 0 &&
         after.mcpServers === 0 &&
         after.pendingTasks === 0 &&
         after.pendingHostcalls === 0 &&
@@ -20782,6 +21011,7 @@ function __pi_get_or_create_extension(extension_id, meta) {
             flags: new Map(),
             flagValues: new Map(),
             messageRenderers: new Map(),
+            entryRenderers: new Map(),
             activeTools: null,
         });
     }
@@ -21392,6 +21622,25 @@ function __pi_register_message_renderer(customType, renderer) {
     __pi_message_renderer_index.set(typeId, record);
 }
 
+// Upstream renders custom session entries (pi.appendEntry) through these; this
+// host has no custom-entry render path yet, so a registration is recorded and
+// never invoked — entries fall back to the default rendering. Still required:
+// pi-subagents calls it unconditionally at load (register-main.js), and a
+// missing method there is a TypeError that drops the whole extension.
+function __pi_register_entry_renderer(customType, renderer) {
+    const ext = __pi_current_extension_or_throw();
+    const typeId = String(customType || '').trim();
+    if (!typeId) {
+        throw new Error('registerEntryRenderer: customType is required');
+    }
+    if (typeof renderer !== 'function') {
+        throw new Error('registerEntryRenderer: renderer must be a function');
+    }
+    const record = { customType: typeId, renderer: renderer, extensionId: ext.id };
+    ext.entryRenderers.set(typeId, record);
+    __pi_entry_renderer_index.set(typeId, record);
+}
+
 	function __pi_register_hook(event_name, handler) {
 	    const ext = __pi_current_extension_or_throw();
 	    const eventName = String(event_name || '').trim();
@@ -21561,12 +21810,16 @@ function __pi_set_thinking_level(level) {
     return pi.events('setThinkingLevel', { thinkingLevel: l });
 }
 
+// Upstream getSessionName() is synchronous (string | undefined); callers do
+// pi.getSessionName()?.trim() without awaiting. The host mirrors the session
+// name into __pi_session_identity with every ctx payload, so read that.
 function __pi_get_session_name() {
-    return pi.session('get_name', {});
+    return __pi_session_identity.name === null ? undefined : __pi_session_identity.name;
 }
 
 function __pi_set_session_name(name) {
     const n = name != null ? String(name) : '';
+    __pi_session_identity.name = n || null;
     return pi.session('set_name', { name: n });
 }
 
@@ -22101,6 +22354,10 @@ function __pi_make_extension_ctx(ctx_payload) {
         __pi_session_identity.id = sessionId;
         __pi_session_identity.file = sessionFile;
         __pi_session_identity.dir = sessionDir;
+        __pi_session_identity.name =
+            typeof sessionState.sessionName === 'string' && sessionState.sessionName
+                ? sessionState.sessionName
+                : null;
     } else {
         // Session-less payloads (extension tool executions ship a minimal
         // {cwd} ctx; shortcuts/emit may pass custom ctx objects) must not
@@ -22284,7 +22541,7 @@ function __pi_project_model_entry(raw) {
 	            try {
 	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
 	            } catch (e) {
-		                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+		                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, (e && (e.stack || e.message)) || e); } catch (_e) {}
 		                continue;
 		            }
 	            if (result && typeof result === 'object') {
@@ -22313,12 +22570,30 @@ function __pi_project_model_entry(raw) {
 	        for (const entry of handlers) {
 	            const handler = entry && entry.handler;
 	            if (typeof handler !== 'function') continue;
-	            const event = { type: 'before_agent_start', prompt, images, systemPrompt: currentSystemPrompt };
+	            // Upstream hands extensions a mutable systemPromptOptions and
+	            // rebuilds the prompt from it; here the prompt is already a
+	            // string, so custom `sections` are appended the way upstream's
+	            // buildSystemPromptSections renders them (<name>\ncontent\n</name>).
+	            // ponytail: selectedTools covers extension-registered tools (or an
+	            // explicit setActiveTools list) — built-in names live host-side and
+	            // are not mirrored into this runtime.
+	            const ownerExt = __pi_extensions.get(entry.extensionId);
+	            const selectedTools = ownerExt && Array.isArray(ownerExt.activeTools)
+	                ? ownerExt.activeTools.slice()
+	                : Array.from(__pi_tool_index.keys()).map((v) => String(v));
+	            const sections = {};
+	            const event = {
+	                type: 'before_agent_start',
+	                prompt,
+	                images,
+	                systemPrompt: currentSystemPrompt,
+	                systemPromptOptions: { selectedTools, sections },
+	            };
 	            let result = undefined;
 	            try {
 	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
 	            } catch (e) {
-		                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+		                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, (e && (e.stack || e.message)) || e); } catch (_e) {}
 		                continue;
 		            }
 	            if (result && typeof result === 'object') {
@@ -22329,6 +22604,13 @@ function __pi_project_model_entry(raw) {
 	                    __pi_current_system_prompt = currentSystemPrompt;
                 }
             }
+	            for (const name of Object.keys(sections)) {
+	                const content = sections[name];
+	                if (typeof content !== 'string' || !content.trim() || !/^[A-Za-z_][\w.-]*$/.test(name)) continue;
+	                currentSystemPrompt = currentSystemPrompt.replace(/\s+$/, '') + '\n\n<' + name + '>\n' + content + '\n</' + name + '>';
+	                modified = true;
+	                __pi_current_system_prompt = currentSystemPrompt;
+	            }
         }
 
         if (messages.length > 0 || modified) {
@@ -22364,7 +22646,7 @@ function __pi_project_model_entry(raw) {
 	            try {
 	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event_payload, ctx));
 	            } catch (e) {
-	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, (e && (e.stack || e.message)) || e); } catch (_e) {}
 	                continue;
 	            }
 	            if (!result || typeof result !== 'object') continue;
@@ -22400,7 +22682,7 @@ function __pi_project_model_entry(raw) {
 	            try {
 	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
 	            } catch (e) {
-	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, (e && (e.stack || e.message)) || e); } catch (_e) {}
 	                continue;
 	            }
 	            if (result === undefined || result === null) {
@@ -22426,7 +22708,7 @@ function __pi_project_model_entry(raw) {
 	        try {
 	            value = await __pi_with_extension_async(entry.extensionId, () => handler(event_payload, ctx));
 	        } catch (e) {
-	            try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	            try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, (e && (e.stack || e.message)) || e); } catch (_e) {}
 	            if (eventName === 'tool_call' || eventName.startsWith('session_before_')) {
 	                throw e;
 	            }
@@ -23053,11 +23335,17 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
     registerMcpServer: __pi_register_mcp_server,
     registerShortcut: __pi_register_shortcut,
     registerMessageRenderer: __pi_register_message_renderer,
+    registerEntryRenderer: __pi_register_entry_renderer,
     on: __pi_register_hook,
     registerFlag: __pi_register_flag,
     getFlag: __pi_get_flag,
     setActiveTools: __pi_set_active_tools,
     getActiveTools: __pi_get_active_tools,
+    // Synchronous like upstream. ponytail: covers extension-registered tools
+    // only — built-ins live host-side and are not mirrored into this runtime;
+    // pi.events('getAllTools') is the complete (async) list. Callers seen so
+    // far (pi-subagents) look up their own registrations here.
+    getAllTools: __pi_get_registered_tools,
     getModel: __pi_get_model,
     setModel: __pi_set_model,
     getThinkingLevel: __pi_get_thinking_level,
@@ -34662,6 +34950,123 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(result["compatCount"], serde_json::json!(1));
             assert_eq!(result["legacyCount"], serde_json::json!(1));
             assert_eq!(result["resetIntact"], serde_json::json!(true));
+        });
+    }
+
+    /// pi-subagents imports `Agent` from `@earendil-works/pi-agent-core` and
+    /// drives it with its own `streamFn`: the loop must run tool calls through
+    /// `beforeToolCall`, feed results back, stop on a plain answer, and record
+    /// a stream failure as an `error` assistant message rather than throwing.
+    #[test]
+    fn pijs_pi_ai_agent_runs_tool_loop_and_fails_closed() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.piAiAgentLoop = {};
+                    (async () => {
+                        const core = await import('@earendil-works/pi-agent-core');
+                        const ai = await import('@earendil-works/pi-ai');
+                        const model = { api: 'fixture-api', provider: 'fixture', id: 'fixture-model' };
+                        const reply = (content, stopReason) => {
+                            const events = ai.createAssistantMessageEventStream();
+                            events.push({ type: 'done', message: { role: 'assistant', content, api: model.api, provider: model.provider, model: model.id, stopReason } });
+                            return events;
+                        };
+                        let calls = 0;
+                        const contexts = [];
+                        const streamFn = (_model, context) => {
+                            contexts.push(context.messages.map((m) => m.role).join(','));
+                            calls += 1;
+                            return calls === 1
+                                ? reply([
+                                    { type: 'toolCall', id: 'c1', name: 'lookup', arguments: { q: 'x' } },
+                                    { type: 'toolCall', id: 'c2', name: 'forbidden', arguments: {} },
+                                  ], 'toolUse')
+                                : reply([{ type: 'text', text: 'final answer' }], 'stop');
+                        };
+                        const tools = [{
+                            name: 'lookup',
+                            execute: async (id, args) => ({ content: [{ type: 'text', text: 'looked up ' + args.q }], details: { id } }),
+                        }];
+                        const agent = new core.Agent({
+                            initialState: { systemPrompt: 'sys', model, thinkingLevel: 'off', tools },
+                            convertToLlm: (messages) => messages,
+                            streamFn,
+                            streamFunction: streamFn,
+                            beforeToolCall: async ({ toolCall }) => toolCall.name === 'lookup' ? undefined : { block: true, reason: 'read-only' },
+                            toolExecution: 'sequential',
+                        });
+                        const events = [];
+                        agent.subscribe((event) => { if (event.type === 'tool_execution_start' || event.type === 'tool_execution_end') events.push(event.type + ':' + event.toolName + (event.isError ? ':err' : '')); });
+                        await agent.prompt('go');
+                        const roles = agent.state.messages.map((m) => m.role);
+                        const toolResults = agent.state.messages.filter((m) => m.role === 'toolResult').map((m) => m.content[0].text);
+                        const last = agent.state.messages[agent.state.messages.length - 1];
+
+                        const failing = new core.Agent({
+                            initialState: { systemPrompt: '', model, tools: [] },
+                            streamFn: () => { throw new Error('modelRegistry.streamSimple is not a function'); },
+                        });
+                        await failing.prompt('go');
+                        const failed = failing.state.messages[failing.state.messages.length - 1];
+
+                        globalThis.piAiAgentLoop = {
+                            calls, contexts, events, roles, toolResults,
+                            lastText: last.content[0].text, lastStop: last.stopReason, streaming: agent.state.isStreaming,
+                            failedStop: failed.stopReason, failedError: failed.errorMessage, failedRoles: failing.state.messages.map((m) => m.role),
+                        };
+                    })().catch((error) => {
+                        globalThis.piAiAgentLoop.error = String((error && error.stack) || error || '');
+                    });
+                    ",
+                )
+                .await
+                .expect("eval pi-agent-core Agent loop");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let result = get_global_json(&runtime, "piAiAgentLoop").await;
+            assert_eq!(
+                result["error"],
+                serde_json::Value::Null,
+                "unexpected error: {result:?}"
+            );
+            assert_eq!(result["calls"], json!(2));
+            assert_eq!(
+                result["contexts"],
+                json!(["user", "user,assistant,toolResult,toolResult"])
+            );
+            assert_eq!(
+                result["events"],
+                json!([
+                    "tool_execution_start:lookup",
+                    "tool_execution_end:lookup",
+                    "tool_execution_start:forbidden",
+                    "tool_execution_end:forbidden:err"
+                ])
+            );
+            assert_eq!(
+                result["roles"],
+                json!(["user", "assistant", "toolResult", "toolResult", "assistant"])
+            );
+            assert_eq!(result["toolResults"], json!(["looked up x", "read-only"]));
+            assert_eq!(result["lastText"], json!("final answer"));
+            assert_eq!(result["lastStop"], json!("stop"));
+            assert_eq!(result["streaming"], json!(false));
+            assert_eq!(result["failedStop"], json!("error"));
+            assert_eq!(result["failedRoles"], json!(["user", "assistant"]));
+            assert!(
+                result["failedError"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("streamSimple is not a function")),
+                "stream failure must surface verbatim: {result:?}"
+            );
         });
     }
 

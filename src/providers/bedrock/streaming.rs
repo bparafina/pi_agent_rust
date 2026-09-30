@@ -295,7 +295,13 @@ impl MessageState {
         // A server_tool_use is performed remotely. Mapping it to ToolCall
         // would authorize a second, local execution with a different trust
         // boundary. Fail closed until the model has a remote-tool vocabulary.
-        if tool.get("type").is_some() {
+        // Bedrock now stamps ordinary local calls with `"type": "tool_use"`
+        // (observed on us.anthropic.claude-haiku-4-5 / sonnet-5 via
+        // Converse, 2026-09-29); that is the one kind that IS a local request.
+        if tool
+            .get("type")
+            .is_some_and(|kind| kind.as_str() != Some("tool_use"))
+        {
             return Err(invalid(
                 "server-managed or unknown tool type is not a local tool request",
             ));
@@ -1345,6 +1351,31 @@ mod tests {
         assert!(!valid_tool_identity("read:file", false));
         assert!(valid_tool_identity(&"x".repeat(64), true));
         assert!(valid_tool_identity(&"x".repeat(64), false));
+    }
+
+    #[test]
+    fn explicit_tool_use_type_is_a_local_tool_request() {
+        let result = collect(vec![
+            start(),
+            event(
+                "contentBlockStart",
+                &json!({"contentBlockIndex": 0, "start": {
+                    "toolUse": {"toolUseId": "call-a", "name": "bash", "type": "tool_use"}
+                }}),
+            ),
+            tool_input(0, "{\"command\":\"echo ok\"}"),
+            block_stop(0),
+            tool_stop(),
+        ]);
+        assert!(result.iter().all(Result::is_ok), "{result:?}");
+        assert!(result.iter().any(|item| matches!(
+            item,
+            Ok(StreamEvent::ToolCallStart { name, .. }) if name == "bash"
+        )));
+        assert!(result.iter().any(|item| matches!(
+            item,
+            Ok(StreamEvent::ToolCallEnd { .. })
+        )));
     }
 
     #[test]
