@@ -2467,6 +2467,21 @@ impl AgentSessionHandle {
         self.session.compact_now(on_event).await
     }
 
+    /// Why every provider call is currently refused with
+    /// `[SESSION_PERSISTENCE_FAILED]`, if that is the case.
+    pub fn provider_quarantine_reason(&self) -> Option<String> {
+        self.session.provider_quarantine_reason()
+    }
+
+    /// Leave provider quarantine by reloading the session from disk and
+    /// installing the persisted transcript as the live one. Returns `Ok(false)`
+    /// when the session was not quarantined. See
+    /// [`AgentSession::recover_from_provider_quarantine`] for what is dropped.
+    pub async fn recover_from_provider_quarantine(&mut self) -> Result<bool> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        self.session.recover_from_provider_quarantine(&cx).await
+    }
+
     /// OMP `/shake`: compaction that drops bulky tool output from the older
     /// span instead of summarizing it with the model (no provider request).
     pub async fn shake(

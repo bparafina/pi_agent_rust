@@ -6511,8 +6511,41 @@ async fn run_controlled_turn(
             &result,
             Ok(message) if message.stop_reason == crate::model::StopReason::Aborted
         );
+    let persistence_fault = matches!(&result, Err(err) if err.is_session_persistence());
     report_turn_result(result, agent_tx);
+    if persistence_fault {
+        recover_from_persistence_fault(handle, agent_tx).await;
+    }
     (leftover, stopped)
+}
+
+/// Open the one-way door a session-persistence fault closes.
+///
+/// A `[SESSION_PERSISTENCE_FAILED]` turn result means a Session transition
+/// left disk and the live transcript possibly diverged and the provider gate
+/// is now quarantined; without this every later prompt fails the same way
+/// until the user starts a new session (handoff bug 2). Reloading from disk
+/// is the only honest resolution — the persisted record is the one that
+/// survives — so do it right here, before the next prompt is accepted, and
+/// tell the user what was dropped so they can resend it.
+async fn recover_from_persistence_fault(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+) {
+    match handle.recover_from_provider_quarantine().await {
+        Ok(true) => {
+            let _ = agent_tx.send(PiMsg::System(
+                "Session reloaded from disk after a persistence fault; the last turn was dropped — resend it."
+                    .to_string(),
+            ));
+        }
+        Ok(false) => {}
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::System(format!(
+                "Session could not be reloaded after a persistence fault ({err}); start a new session with /new."
+            )));
+        }
+    }
 }
 
 fn report_turn_result(

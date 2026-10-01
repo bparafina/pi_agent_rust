@@ -13493,6 +13493,89 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Why provider re-entry is currently quarantined, if it is.
+    ///
+    /// `Some` means a Session transition (retry restoration, model switch,
+    /// failover) left the persisted record and the live transcript possibly
+    /// diverged, and every provider call will fail with
+    /// `[SESSION_PERSISTENCE_FAILED]` until [`Self::recover_from_provider_quarantine`]
+    /// resolves which one is the truth.
+    pub fn provider_quarantine_reason(&self) -> Option<String> {
+        self.provider_admission.reason()
+    }
+
+    /// Leave provider quarantine by making the persisted record the truth.
+    ///
+    /// The quarantine is a one-way door by design: once a transition's
+    /// persistence is indeterminate, nothing in-process can say whether the
+    /// disk or the live transcript is correct, so the gate refuses every
+    /// provider call rather than bill work against a record nobody can
+    /// describe. Before this method the only exit was a new session, which
+    /// threw away a working conversation over what is usually a transient
+    /// write fault. The honest recovery is to stop guessing: reload the
+    /// session file, install exactly what it holds as the live transcript, and
+    /// then clear the gate. Whatever the interrupted transition had in memory
+    /// but never made durable is dropped — the caller should say so to the
+    /// user, because the last turn they typed may be gone.
+    ///
+    /// Returns `Ok(false)` when there is no quarantine to recover from. A
+    /// session without a backing file (`save_enabled` off, or in-memory) has
+    /// nothing to reload, so there the live transcript is the only record and
+    /// the gate simply clears. Holding the admission permit across the whole
+    /// reload keeps a concurrent provider call from observing a half-installed
+    /// transcript.
+    pub async fn recover_from_provider_quarantine(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+    ) -> Result<bool> {
+        if self.provider_admission.reason().is_none() {
+            return Ok(false);
+        }
+        let session_store = Arc::clone(&self.session);
+        let mut inner = OwnedMutexGuard::lock(session_store, cx)
+            .await
+            .map_err(|err| {
+                Error::session(format!("quarantine recovery session lock failed: {err}"))
+            })?;
+        let _permit = self.provider_admission.acquire(cx.cx()).await?;
+
+        let disk_path = if self.save_enabled {
+            inner.path.clone()
+        } else {
+            None
+        };
+        if let Some(path) = disk_path {
+            let path_str = path.to_str().ok_or_else(|| {
+                Error::session(format!(
+                    "quarantine recovery: session path is not valid UTF-8: {}",
+                    path.display()
+                ))
+            })?;
+            let mut reloaded = Session::open(path_str).await.map_err(|err| {
+                Error::session(format!(
+                    "quarantine recovery: reloading {} failed: {err}",
+                    path.display()
+                ))
+            })?;
+            if reloaded.header.id != inner.header.id {
+                return Err(Error::session(format!(
+                    "quarantine recovery: {} holds session {} but the live session is {}",
+                    path.display(),
+                    reloaded.header.id,
+                    inner.header.id
+                )));
+            }
+            reloaded.session_dir.clone_from(&inner.session_dir);
+            *inner = reloaded;
+        }
+
+        let messages = inner.to_messages_for_current_path();
+        self.invalidate_background_compaction();
+        self.agent.replace_messages(messages);
+        self.provider_admission.clear();
+        Ok(true)
+    }
+
     /// Everything a fallback-chain swap does to the session and the live agent.
     ///
     /// Print mode and the RPC server each carried this whole transition — revert
@@ -20053,6 +20136,106 @@ mod tests {
                 .await
                 .expect_err("quarantine must block later provider re-entry");
             assert!(blocked.is_session_persistence());
+        });
+    }
+
+    /// The exit from the one-way door: a quarantined session reloads from
+    /// disk, installs the persisted transcript as the live one, and clears the
+    /// gate — dropping whatever the interrupted transition held only in
+    /// memory.
+    #[test]
+    fn recover_from_provider_quarantine_reloads_disk_and_clears_gate() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth_path = dir.path().join("auth.json");
+            let auth = AuthStorage::load(auth_path).expect("load auth");
+            let mut agent_session = build_switch_test_session(&auth);
+            let session_path = dir.path().join("recover.jsonl");
+            let cx = crate::agent_cx::AgentCx::for_request();
+
+            // Persist one turn, then diverge the live transcript with a second
+            // message that never reaches disk — the shape a half-finished
+            // transition leaves behind.
+            {
+                let mut session = agent_session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session lock");
+                session.path = Some(session_path.clone());
+                session.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text("durable turn".to_string()),
+                    timestamp: Some(0),
+                });
+                session.save().await.expect("save durable turn");
+                session.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text("never persisted".to_string()),
+                    timestamp: Some(1),
+                });
+                agent_session
+                    .agent
+                    .replace_messages(session.to_messages_for_current_path());
+            }
+            agent_session.save_enabled = true;
+            assert_eq!(agent_session.agent.messages().len(), 2);
+
+            assert!(
+                !agent_session
+                    .recover_from_provider_quarantine(&cx)
+                    .await
+                    .expect("recovery without a quarantine is a no-op"),
+                "nothing to recover when the gate is open"
+            );
+
+            agent_session
+                .provider_admission
+                .block("test: indeterminate persistence".to_string());
+            assert!(agent_session.provider_quarantine_reason().is_some());
+            assert!(agent_session.ensure_provider_reentry_allowed().is_err());
+
+            assert!(
+                agent_session
+                    .recover_from_provider_quarantine(&cx)
+                    .await
+                    .expect("recovery reloads the persisted session")
+            );
+
+            assert!(agent_session.provider_quarantine_reason().is_none());
+            agent_session
+                .ensure_provider_reentry_allowed()
+                .expect("gate clears after recovery");
+
+            let disk = Session::open(session_path.to_str().expect("utf-8 path"))
+                .await
+                .expect("reopen persisted session");
+            let disk_messages = disk.to_messages_for_current_path();
+            assert_eq!(disk_messages.len(), 1, "only the saved turn is on disk");
+            let disk_json = serde_json::to_value(&disk_messages).expect("serialize disk messages");
+            assert_eq!(
+                serde_json::to_value(agent_session.agent.messages()).expect("serialize live"),
+                disk_json,
+                "the live transcript is exactly what disk holds"
+            );
+
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            assert_eq!(session.header.id, disk.header.id);
+            assert_eq!(
+                session.path, disk.path,
+                "the reloaded session keeps its backing file"
+            );
+            assert_eq!(
+                serde_json::to_value(session.to_messages_for_current_path())
+                    .expect("serialize reloaded"),
+                disk_json
+            );
         });
     }
 
