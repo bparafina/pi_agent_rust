@@ -3154,6 +3154,9 @@ impl PiFtuiModel {
                 let name = sanitize(&name).into_owned();
                 let pair = sanitize(&tool_id).into_owned();
                 let output = output.map(|o| sanitize(&o).into_owned());
+                if name == "todo" && !is_error {
+                    self.publish_todos_slot(output.as_deref());
+                }
                 let diff_styled = matches!(name.as_str(), "edit" | "hashline_edit");
                 self.finish_tool_card(&pair, &name, !is_error, output, diff_styled);
                 self.current_tool = None;
@@ -3806,6 +3809,11 @@ impl PiFtuiModel {
             self.pending_quit = true;
             return true;
         }
+        // `/col …` steers the prompt-area slot stack (ported from colbar.ts).
+        if let Some(cmd) = slots::ColCommand::parse(clean) {
+            self.run_col_command(cmd);
+            return true;
+        }
         // OMP's /plan-review re-opens the review of the latest plan.
         if canon == "/plan-review" {
             self.begin_busy("updating plan ...");
@@ -4330,6 +4338,89 @@ impl PiFtuiModel {
         }
         // /skill: inputs flow through to the agent as prompts.
         false
+    }
+
+    /// Mirror the native `todo` tool's rendered list into the `todos` slot.
+    /// The list is an ephemeral filler: it yields to heavier panels and an
+    /// empty list removes it.
+    fn publish_todos_slot(&mut self, output: Option<&str>) {
+        let lines: Vec<ftui::text::Line<'static>> = match output {
+            Some(text) if !text.starts_with("(todo list is empty)") => text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| ftui::text::Line::raw(line.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        self.slots
+            .set(slots::SlotSpec::native("todos", 100).ephemeral(true), lines);
+    }
+
+    /// Carry out a parsed `/col …` command against the slot registry and
+    /// tell the user what changed, in a System line.
+    fn run_col_command(&mut self, cmd: slots::ColCommand) {
+        use slots::{ColCommand, Placement};
+
+        let placement_name = |placement: Placement| match placement {
+            Placement::Auto => "auto",
+            Placement::Below => "below",
+            Placement::Side => "side",
+            Placement::Hidden => "hidden",
+        };
+        match cmd {
+            ColCommand::Next | ColCommand::Prev => {
+                let forward = matches!(cmd, ColCommand::Next);
+                let line = match self.slots.step_focus(forward) {
+                    Some(id) => format!("slot focus: {id}"),
+                    None => String::from("no slots registered"),
+                };
+                self.push_entry(EntryRole::System, line);
+            }
+            ColCommand::Placement(placement) => {
+                self.slots.set_placement(placement);
+                self.push_entry(
+                    EntryRole::System,
+                    format!("slot placement: {}", placement_name(placement)),
+                );
+            }
+            ColCommand::Float(id) => {
+                let target = if id.is_empty() {
+                    self.slots.focused().map(str::to_string)
+                } else {
+                    Some(id)
+                };
+                let Some(target) = target else {
+                    self.push_entry(EntryRole::Error, String::from("no slot to float"));
+                    return;
+                };
+                if let Err(message) = self.slots.float(&target) {
+                    self.push_entry(EntryRole::Error, message);
+                }
+            }
+            ColCommand::Select(id) => {
+                if self.slots.focus_id(&id) {
+                    if self.slots.floating() == Some(id.as_str()) {
+                        self.slots.unfloat();
+                    }
+                    self.push_entry(EntryRole::System, format!("slot focus: {id}"));
+                } else {
+                    self.push_entry(EntryRole::Error, format!("no slot named {id}"));
+                }
+            }
+            ColCommand::List => {
+                let ids: Vec<&str> = self.slots.ids().collect();
+                let listing = if ids.is_empty() {
+                    String::from("(none)")
+                } else {
+                    ids.join(", ")
+                };
+                let line = format!(
+                    "slots: {listing} · placement: {}",
+                    placement_name(self.slots.placement())
+                );
+                self.push_entry(EntryRole::System, line);
+            }
+        }
     }
 
     fn handle_picker_key(&mut self, key: &ftui::KeyEvent) {
@@ -4938,6 +5029,11 @@ impl PiFtuiModel {
                         return self.consume_scroll(|m| m.scroll_down(page));
                     }
                     Some(AppAction::Exit) if self.input.is_empty() => return Cmd::quit(),
+                    Some(AppAction::Interrupt) if self.slots.floating().is_some() => {
+                        // Escape closes the floating slot window first.
+                        self.slots.unfloat();
+                        return Cmd::none();
+                    }
                     Some(AppAction::Interrupt) if self.active_ask.is_some() => {
                         // Escape dismisses the pending ask card.
                         if let Some(ask) = self.active_ask.take() {
@@ -6050,12 +6146,30 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
             is_error,
             result,
             ..
-        } => vec![PiMsg::ToolEnd {
-            name: tool_name.clone(),
-            tool_id: tool_call_id.clone(),
-            is_error: *is_error,
-            output: tool_output_preview(result),
-        }],
+        } => {
+            let mut msgs = vec![PiMsg::ToolEnd {
+                name: tool_name.clone(),
+                tool_id: tool_call_id.clone(),
+                is_error: *is_error,
+                output: tool_output_preview(result),
+            }];
+            // Todo footer: state-driven off the tool result's todo_list.v1
+            // details, never a side channel (mirrors the classic TUI).
+            if tool_name == "todo"
+                && !is_error
+                && let Some(details) = &result.details
+                && details.get("schema").and_then(serde_json::Value::as_str)
+                    == Some(crate::todo::TODO_LIST_SCHEMA)
+            {
+                msgs.push(PiMsg::TodoSummary {
+                    summary: details
+                        .get("summary")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                });
+            }
+            msgs
+        }
         E::AutoRetryStart {
             attempt,
             max_attempts,
@@ -12190,6 +12304,140 @@ mod tests {
             serde_json::json!({"widgetKey": "k", "lines": []}),
         );
         assert!(sim.model().slots.is_empty(), "empty content clears the slot");
+    }
+
+    #[test]
+    fn col_float_and_escape_promote_and_dismiss_a_slot() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": "k", "lines": ["a", "b"]}),
+        );
+
+        sim.model_mut().input.set_text("/col float k");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(sim.model().slots.floating(), Some("k"));
+        assert!(sim.is_running());
+
+        // Esc closes the float before anything else looks at the key.
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert_eq!(sim.model().slots.floating(), None);
+        assert!(sim.is_running(), "Esc on the float must not interrupt");
+
+        // Floating an unknown slot reports, rather than silently no-ops.
+        let before = sim.model().transcript.len();
+        sim.model_mut().input.set_text("/col float nope");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model().transcript[before..]
+                .iter()
+                .any(|entry| entry.text.contains("no slot named nope")),
+            "missing slot error not surfaced"
+        );
+
+        // Bare /col lists ids and placement; /col hide switches placement.
+        sim.model_mut().input.set_text("/col hide");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(sim.model().slots.placement(), slots::Placement::Hidden);
+        let before = sim.model().transcript.len();
+        sim.model_mut().input.set_text("/col");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model().transcript[before..]
+                .iter()
+                .any(|entry| entry.text.contains("slots: k") && entry.text.contains("hidden")),
+            "/col listing missing"
+        );
+    }
+
+    #[test]
+    fn registered_slot_takes_a_sidebar_when_wide_and_rows_below_when_narrow() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": "k", "lines": ["a", "b", "c"]}),
+        );
+        // Same arithmetic render_frame uses: header + status + editor + footer.
+        let fixed_rows = 1 + 1 + sim.model().input_rows() + 1;
+
+        let wide = sim.model().slots.layout(160, 50, fixed_rows);
+        assert!(wide.side_cols > 0, "wide terminal should get a sidebar");
+        assert_eq!(wide.below_rows, 0);
+        let regions = layout_regions(Rect::new(0, 0, 160, 50), 1, 0, 0, 0, wide.side_cols);
+        assert_eq!(regions.sidebar.width, wide.side_cols);
+        assert_eq!(regions.body.width + regions.sidebar.width, 160);
+        assert_eq!(regions.status.width, 160, "chrome rows keep full width");
+
+        let narrow = sim.model().slots.layout(80, 30, fixed_rows);
+        assert_eq!(narrow.side_cols, 0);
+        assert_eq!(narrow.below_rows, 3, "three lines, under the budget");
+        let regions = layout_regions(Rect::new(0, 0, 80, 30), 1, 0, 0, narrow.below_rows, 0);
+        assert_eq!(regions.slots_below.height, 3);
+        assert_eq!(regions.status.y + 1, regions.slots_below.y);
+        assert_eq!(regions.slots_below.y + 3, regions.input.y);
+    }
+
+    #[test]
+    fn todo_tool_end_feeds_the_todos_slot_and_footer() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "todo".into(),
+            tool_id: "t1".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "todo".into(),
+            tool_id: "t1".into(),
+            is_error: false,
+            output: Some("[>] write spec\n[ ] ship\n\n0/2 settled".into()),
+        }));
+        assert_eq!(sim.model().slots.ids().collect::<Vec<_>>(), vec!["todos"]);
+        assert_eq!(
+            sim.model().slots.slot(0).map(|slot| slot.lines.len()),
+            Some(3),
+            "blank separator line is dropped"
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "todo".into(),
+            tool_id: "t2".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "todo".into(),
+            tool_id: "t2".into(),
+            is_error: false,
+            output: Some("(todo list is empty)".into()),
+        }));
+        assert!(sim.model().slots.is_empty(), "empty list clears the slot");
+
+        // The agent-event bridge now publishes the footer summary too.
+        let msgs = agent_event_to_pi_msgs(&crate::agent::AgentEvent::ToolExecutionEnd {
+            tool_call_id: "t3".into(),
+            tool_name: "todo".into(),
+            is_error: false,
+            result: crate::tools::ToolOutput {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new("[ ] a\n\n0/1 settled"),
+                )],
+                details: Some(serde_json::json!({
+                    "schema": crate::todo::TODO_LIST_SCHEMA,
+                    "summary": "0/1 · a",
+                })),
+                is_error: false,
+            },
+        });
+        assert!(msgs.iter().any(|msg| matches!(
+            msg,
+            PiMsg::TodoSummary { summary: Some(summary) } if summary == "0/1 · a"
+        )));
     }
 
     #[test]

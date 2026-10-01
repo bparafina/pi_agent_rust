@@ -1,5 +1,48 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 8, 2026-10-01, iteration-budget handoff)
+
+Branch `fix/bedrock-tool-use-type-and-pijs-compat`. Not pushed. Nothing installed since build 7.
+Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs`.
+
+### Slot framework wiring — CODE COMPLETE (steps 5, 6, 8, 9 landed this commit)
+- **Session 7's wiring type-checks.** Its `cargo check` had been SIGTERM'd unobserved; re-run this session reported
+  exactly one error — `run_col_command` missing — which was the method I was adding at that moment. Nothing else in
+  the layout/render/setWidget/❯-icon wiring needed fixing.
+- Step 5 `/col`: `slots::ColCommand::parse(clean)` arm right after `/exit|/quit|/q` in `route_slash_command_tail`;
+  `fn run_col_command` (after `route_slash_command_tail`'s end, ~4340) handles Next/Prev/Placement/Float/Select/List
+  with System/Error lines. Added `SlotRegistry::focus_id(&str) -> bool` in `slots.rs`.
+- Step 6 Esc: `Some(AppAction::Interrupt) if self.slots.floating().is_some()` arm BEFORE the `active_ask` arm.
+- Step 8 todos: `agent_event_to_pi_msgs` `E::ToolExecutionEnd` now also emits `PiMsg::TodoSummary` (mirrors
+  `src/interactive/agent.rs:556`) — the FTUI todo footer was dead before this. `PiMsg::ToolEnd` handler calls
+  `publish_todos_slot(output)` for `todo` tool, non-error → `SlotSpec::native("todos", 100).ephemeral(true)`,
+  blank lines dropped, `(todo list is empty)` clears.
+- Step 9 tests (in `mod tests` after `set_widget_lands_in_a_slot_instead_of_the_transcript`):
+  `col_float_and_escape_promote_and_dismiss_a_slot`, `registered_slot_takes_a_sidebar_when_wide_and_rows_below_when_narrow`,
+  `todo_tool_end_feeds_the_todos_slot_and_footer`. Pure/simulator-based; run on the Linux lane (bug 4 on macOS).
+
+### Next agent, step 1 — confirm the tree compiles
+A second `cargo check --locked --bin pi` was started AFTER all edits above (job log
+`~/.pi/agent-rust/tool-output-artifacts/jobs/job-45644be6d88842179f60996442080253.log`, grep'd to `src/interactive_ftui`
++ `error` lines, ends with `EXIT n`). Read it; if the session died first, re-run the command. Likely nits if any:
+`Placement` needs `Copy` for the `placement_name` closure (it is `Copy`); `matches!(cmd, ColCommand::Next)` after
+moving `cmd` into the match — if E0382, bind `forward` before the `match`.
+Then `cargo check --locked --all-targets --message-format short` for the test module (the `/col` test uses
+`sim.model_mut().input.set_text` + Enter like `catalog_routes_shift_enter_newline_and_ctrl_d_exit`).
+
+### Step 2 — release build + live verify (carried from sessions 6/7; never completed)
+Both prior background builds died with their sessions; `/tmp/pi-release-wt/target/release/pi` does NOT exist.
+Re-run in the worktree (`cd /tmp/pi-release-wt && git checkout <this commit> && cargo build --locked --release --bin pi`),
+expect ~40+ min cold. Then the install recipe + `/tmp/rpi-extfail-probe.py`, rename `zz-broken-probe.ts` → `.disabled`,
+`/tmp/rpi-quit2.py`, `/tmp/rpi-probe4.py`. Live-check `/col`, `/col float todos`, Esc, and the todo footer with the
+`todo` tool. The worktree removal needs the user's OK (Rule 1).
+
+### Then (unchanged order)
+Floating overlay for ask cards/pickers on the same primitive → ttfx gate → shimmer "Working…" → cycling thinking
+words / "Thought for Ns" → native colbar panels (working set, modelbar/devbar/flowbar) → read gutter.
+
+---
+
 ## STATUS UPDATE (session 7, 2026-10-01, iteration-budget handoff)
 
 Branch `fix/bedrock-tool-use-type-and-pijs-compat`. Not pushed. Nothing installed since build 7.

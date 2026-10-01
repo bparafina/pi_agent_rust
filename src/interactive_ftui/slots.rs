@@ -251,6 +251,17 @@ impl SlotRegistry {
         self.slots.get(self.focus).map(|slot| slot.spec.id.as_str())
     }
 
+    /// Focus a slot by id for `/col <id>`. Reports whether it exists.
+    pub(crate) fn focus_id(&mut self, id: &str) -> bool {
+        match self.slots.iter().position(|slot| slot.spec.id == id) {
+            Some(index) => {
+                self.focus = index;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Decide where every slot goes for a frame of `width × height`, given
     /// the rows the editor and the fixed chrome (header, status, footer,
     /// banner, completion) already take.
