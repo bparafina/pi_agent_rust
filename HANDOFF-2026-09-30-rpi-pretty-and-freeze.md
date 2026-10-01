@@ -22,7 +22,21 @@ fine (fail-open works), but the **"Extension zz-broken-probe failed to load and 
 - Not yet checked: whether the unit test for this (Bug 2/3 FTUI test) uses a simulator path that never sends
   `ConversationReset`, which is why it passed.
 
-### Next agent, step 1 — fix (small, one file)
+### Next agent, step 1 — fix: LANDED (`5932daf53`, session 9 continued)
+Option (a): `report_extension_load_failures(&handle, &agent_tx)` moved out of `create_driver_session` to the driver,
+right after `send_conversation_reset(...)` (`src/interactive_ftui.rs` ~8971). Simulator test
+`a_system_line_sent_before_the_startup_reset_is_wiped_and_one_after_survives` added next to
+`a_background_note_arriving_mid_turn_waits_for_the_turn_boundary` (pins the before/after contract; statically
+reviewed only — lib test target won't build on macOS, bug 4). `cargo check --locked --bin pi`: EXIT 0.
+Release rebuild in the worktree at `5932daf53`:
+`~/.pi/agent-rust/tool-output-artifacts/jobs/job-75b70fc37a1f4b2ab53005f6ce35d580.log` → `/tmp/pi-release-wt/target/release/pi`.
+When it ends with `EXIT 0`: `cp /tmp/pi-release-wt/target/release/pi ~/.local/bin/pi-rust.new && mv -f
+~/.local/bin/pi-rust.new ~/.local/bin/pi-rust`, then `python3 /tmp/rpi-extfail-probe.py` → expect
+`skip_line_seen=<n>s` and `> Extension zz-broken-probe failed to load and was skipped: …`.
+Note: cargo in a background shell here resolved to `/opt/homebrew/bin/cargo` (stable) and failed on `-Z`;
+prefix with `export PATH="$HOME/.cargo/bin:$PATH"`.
+
+### Original fix plan (kept for reference)
 Pick one in `src/interactive_ftui.rs`:
 (a) move `report_extension_load_failures(&handle, agent_tx)` out of `create_driver_session` (line 8754) to the driver
 after `send_conversation_reset(...)` at line 8970 (simplest; keeps the line as a System transcript entry); or
