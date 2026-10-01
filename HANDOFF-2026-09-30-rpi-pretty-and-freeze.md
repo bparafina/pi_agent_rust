@@ -1,0 +1,197 @@
+# Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
+
+## STATUS UPDATE (session 3, 2026-10-01, iteration-budget handoff)
+
+Branch `fix/bedrock-tool-use-type-and-pijs-compat`, HEAD `e24c0582f` (on top of `030b6344c`). Not pushed.
+Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs`. Nothing installed since build 7.
+
+### Bug 1 — verification was IN FLIGHT when the budget ran out
+`PATH=~/.cargo/bin:$PATH cargo test --locked --test session_conformance assistant_entry_serialization_is_stable`
+was started in the background (pid 5161, log
+`~/.pi/agent-rust/tool-output-artifacts/jobs/job-c17b87e835064990b262de8046bfc549.log`, output only appears
+at the end because of `| tail -30`). **Next agent, step 1:** read that log (or re-run the command). Green ⇒
+bug 1 closed (the `float_roundtrip` serde_json feature is already committed in `030b6344c`).
+
+### Bug 2 — WRITTEN in `e24c0582f`, NOT YET TYPE-CHECKED (cargo lock was held by the bug-1 build)
+- `src/agent.rs` right after `restore_retry_tail_with_admission`: `AgentSession::provider_quarantine_reason()`
+  and `async recover_from_provider_quarantine(&mut self, cx) -> Result<bool>` (locks session, acquires admission
+  permit, `Session::open(path)` when `save_enabled && path.is_some()`, header.id must match, keeps `session_dir`,
+  `replace_messages(to_messages_for_current_path())`, `invalidate_background_compaction()`, `clear()`).
+- `src/sdk.rs` `AgentSessionHandle`: thin `provider_quarantine_reason()` / `recover_from_provider_quarantine()`
+  (next to `compact`).
+- `src/interactive_ftui.rs` `run_controlled_turn`: `persistence_fault` flag → `recover_from_persistence_fault(handle, agent_tx)`
+  posts `PiMsg::System("Session reloaded from disk after a persistence fault; the last turn was dropped — resend it.")`.
+- Test `recover_from_provider_quarantine_reloads_disk_and_clears_gate` after
+  `set_provider_model_quarantines_failed_persistence_without_runtime_mutation` (~20142). Compares messages via
+  `serde_json::to_value` (Message has no PartialEq) and `session.path == disk.path` (tempdir may canonicalize).
+**Next agent, step 2:** `PATH=~/.cargo/bin:$PATH cargo check --locked --bin pi` then fix whatever it reports
+(likely candidates: borrow of `handle` after `turn.await` in `run_controlled_turn` — `control` is an owned clone so it
+should be fine; `UserContent` import in the test module — it's already used at ~21131). `cargo test --lib` won't build on
+macOS (bug 4), so the new unit test can only run via the Linux lane / dsr. Then rebuild release, install with the
+`cp … pi-rust.new && mv -f` recipe, and reproduce: force a quarantine (e.g. `requestTimeoutSecs` low on Bedrock xhigh)
+and confirm the next prompt works and the System line appears.
+
+### Bug 3 — investigated, policy decision still open (ask the user)
+`sdk::create_agent_session` → `agent_session.enable_extensions_with_policy(…).await?` (sdk.rs ~3085) →
+`manager.load_js_extensions(js_specs).await?` (agent.rs ~15301). One bad extension fails the whole session; TS pi
+logs and skips. Options: (a) skip-and-warn per extension with a startup System line listing failures (matches TS,
+matches the rpi profile pain described below), (b) keep fail-closed but surface the failing extension name in the
+FTUI instead of a dead "pi · ready" screen. Recommend (a) with a `extensions.failClosed` setting defaulting false.
+
+### Bug 4 — untouched.
+
+### After the bugs (unchanged order)
+Prompt-area slot framework (+ `❯` icon by thinking level) → floating overlay/sidebar → ttfx gate → shimmer →
+cycling thinking words → native colbar panels → read gutter. See "Pi-rust sugar — revised design" below.
+
+---
+
+## STATUS UPDATE (session 2, 2026-09-30, iteration-budget handoff)
+
+Committed `030b6344c` on `fix/bedrock-tool-use-type-and-pijs-compat` (everything from the
+"Uncommitted changes" section below except the other session's `src/providers/bedrock/streaming.rs`,
+which is still uncommitted and NOT mine). Not pushed. Nothing installed since build 7.
+
+### Bug 1 — ROOT-CAUSED AND FIXED (verification run in flight)
+Not key order. `serde_json`'s default parser is **best-effort float precision**: the computed cost
+`0.012705000000000001` on disk re-parsed as `0.012705`, so `prepare_jsonl_full_rewrite`'s byte
+compare flagged an unchanged entry. Fix: `serde_json` feature `float_roundtrip` in `Cargo.toml`
+(comment explains why). Regression test added at the end of `tests/session_conformance.rs`:
+`assistant_entry_serialization_is_stable_across_disk_round_trip` — observed RED before the feature.
+**Next agent, step 1:** `PATH=~/.cargo/bin:$PATH cargo test --locked --test session_conformance assistant_entry_serialization_is_stable`
+(full rebuild ~several minutes because the feature change invalidates serde_json downstream; a
+background run was started but not observed). If green, bug 1 is closed.
+
+### Bug 2 — DESIGNED, NOT WRITTEN
+The quarantine (`ProviderAdmissionGate` in `agent.rs` ~5966; `block/clear/reason`) is intentional:
+in-memory vs disk may have diverged. Correct recovery = **reload from disk and clear the gate**.
+Planned method on `AgentSession` right after `restore_retry_tail_with_admission` (~13494):
+
+```rust
+pub fn provider_quarantine_reason(&self) -> Option<String>   // self.provider_admission.reason()
+pub async fn recover_from_provider_quarantine(&mut self, cx: &AgentCx) -> Result<bool>
+```
+Body: return Ok(false) if no reason; lock `self.session` (OwnedMutexGuard), then
+`self.provider_admission.acquire(cx.cx())` permit; if `self.save_enabled && inner.path.is_some()` →
+`Session::open(path_str)`, assert `header.id` matches, `reloaded.session_dir.clone_from(&inner.session_dir)`,
+`*inner = reloaded`; then `self.invalidate_background_compaction()`,
+`self.agent.replace_messages(inner.to_messages_for_current_path())`, `self.provider_admission.clear()`,
+Ok(true). Expose on `sdk::AgentSessionHandle` (it has `session_mut()`; add a thin async wrapper).
+Surface in FTUI: `report_turn_result` (`interactive_ftui.rs` ~6518) → in the `Err(err)` arm, if
+`err.is_session_persistence()`, call the recovery on `handle` from `run_controlled_turn` and send
+`PiMsg::System("Session reloaded from disk after a persistence fault; the last turn was dropped — resend it.")`.
+Add a unit test next to `set_provider_model_quarantines_failed_persistence_without_runtime_mutation`
+(~19969) that blocks the gate and asserts recovery clears it and messages == disk path.
+
+### Bug 3 (extension load fail-closed) and Bug 4 (macOS `cargo test --lib` / rustfmt) — untouched.
+
+### After the bugs (user's stated order)
+Prompt-area framework → floating TUI → shimmer "Working…" → thinking words ("Thought for Ns") →
+colbar components. See "Pass 2 roadmap" below for the pi-pretty references.
+
+---
+
+Branch: `fix/bedrock-tool-use-type-and-pijs-compat` (HEAD `5a1f22af2`). **Nothing committed yet.**
+Installed binary: `~/.local/bin/pi-rust` = build 7 of this tree (`pi 0.6.1 (5a1f22af2 …)`), backup `~/.local/bin/pi-rust.release-0.6.1`.
+Always install with `cp target/release/pi ~/.local/bin/pi-rust.new && mv -f … pi-rust` — an in-place `cp` invalidates the macOS code-signature cache (SIGKILL on exec) and clobbers a running session.
+
+## Uncommitted changes (9 files; `git diff --stat`)
+
+Mine (8):
+- `Cargo.toml` — `ftui-extras` gains the `syntax` feature (ftui's own tokenizers; no syntect).
+- `src/interactive_ftui.rs`
+  - **Freeze fix**: `App::…with_budget(FrameBudgetConfig{ total: 33ms, allow_frame_skip: false })`. ftui-runtime 0.7.0's conformal frame guard cascades to `SkipFrame` after ONE slow frame (~25ms vs 16ms default) and, since skipped frames record no timing, never recovers → screen frozen, event loop idle in `kevent`, agent keeps working. Verified: 13/13 probe runs clean, guard still fires but skips 0 frames. Worth an upstream frankentui issue.
+  - Native pi-pretty analog: `DetailBody` enum (`Plain|Diff|Code|Listing|Find|Grep`) selected by `TranscriptEntry::detail_body`; `read` bodies syntax-highlighted by extension; `ls` nerd-font icons (`file_icon`, gated by `terminal.nerdFontIcons`); `find` grouped by directory; `grep` per-file headers + `(?i)` pattern highlight (pattern recovered from the card head); bash `· exit N` (parsed off `Command exited with code N` trailer) and `· 1.2s` elapsed on every settled card; failed-card bodies in error color. Shared `Arc<SyntaxHighlighter>` also feeds `MarkdownRenderer::with_syntax_highlighter` → assistant code fences highlight.
+  - Tests added (can't run locally: `cargo test --lib` doesn't build on macOS at HEAD — pre-existing `rustix::fs::mkfifoat` in `artifact_output.rs:424`, `browser/download.rs:481`): `read_card_body_is_syntax_highlighted_and_ls_card_gets_icons`, `tool_cards_show_exit_code_elapsed_grep_and_find_grouping`, `split_bash_exit_trailer_and_format_elapsed`.
+- `src/config.rs`, `src/main.rs`, `tests/config_precedence.rs`, `tests/tui_state.rs` — `terminal.nerdFontIcons` (`TerminalSettings.nerd_font_icons`, default false) plumbed into `FtuiSettings`.
+- `src/providers/bedrock.rs` — **Bedrock fix**: `build_request` folds consecutive same-role messages. Pi stores each tool result as its own `Message::ToolResult`, so parallel tool calls became consecutive `user` messages and Converse 400'd (`Expected toolResult blocks at messages.2.content`). Test `build_request_folds_parallel_tool_results_into_one_user_message`.
+- `src/extensions_js.rs` — pi-tui shim exports `HStack`/`VStack` (stubs). `~/.pi/agent-rust/extensions/colbar.ts` imports `HStack`; a missing export fails the whole extension at load.
+
+Not mine (leave alone): `src/providers/bedrock/streaming.rs` (another session's edit, 9 lines).
+
+Gate used: `cargo check --locked --bin pi` clean (nightly-2026-08-31 via `~/.cargo/bin`). `dsr` is not installed on this machine. The repo is not rustfmt-clean at HEAD — never run bare `cargo fmt` (a worker did; 33 files reverted).
+
+## rpi profile changes (`~/.pi/agent-rust/settings.json`, backup `settings.json.bak-1946`)
+- `packages` pruned to `[npm:@earendil-works/pi-voice, git:github.com/apmantza/pi-lens]`. Dropped (fail to load in rpi's QuickJS → **session creation is fail-closed** → UI stuck at "pi · ready", no status bar, prompts dead, quit hangs): pi-mcp-adapter, pi-plan-mode, rpiv-todo (`@juicesharp/rpiv-config` unresolved), rpiv-ask-user-question, ponytail (JS private fields), pi-web-access, pi-fff, pi-btw, pi-subagents (OOMs the 256MB shard when combined; native `subagent` tool is already enabled by the `rpi` wrapper). Startup now 2.3s, shutdown 0.8s.
+- `terminal.nerdFontIcons: true`.
+- `requestTimeoutSecs: 300` — the body-stream **idle** timeout defaults to 60s for remote providers (`http/client.rs DEFAULT_REMOTE_REQUEST_TIMEOUT_SECS`); Bedrock + xhigh thinking pauses longer than that and the resulting `Request timed out reading body stream` is what kicks off the quarantine bug below.
+
+## Open bugs (not fixed)
+1. **Retry restoration quarantines the session on a false conflict.** `Agent::restore_retry_tail_with_admission` (`agent.rs` ~13433) → `candidate.save()` → `prepare_jsonl_full_rewrite` (`session.rs` ~1824) byte-compares re-parsed disk entries against in-memory ones and errored `session entry ID 37793397 has conflicting persisted and in-memory payloads` on a *completed, normal* assistant message (thinking + bash toolCall). Nothing mutates persisted entries in-process (`get_entry_mut` only used for plan Custom entries), so it's a serialize/round-trip instability — prime suspect: `serde_json` `preserve_order` is active via a transitive dep (lock shows `indexmap` under serde_json despite the Cargo.toml comment) so object key order can differ between the streamed form and the re-parsed form. Repro material: `~/.pi/agent-rust/sessions/--Users-bparafina-Projects-pi_agent_rust--/2026-10-01T01-10-56.738Z_10931da9.jsonl` line 70. Fix direction: compare `serde_json::Value`s (semantic), not bytes.
+2. **Quarantine is a one-way door.** After (1), every provider call fails with `[SESSION_PERSISTENCE_FAILED] provider re-entry is quarantined…` until a new session. Needs a recovery path.
+3. Extension load failure aborts session creation (`sdk::create_agent_session` fail-closed; TS pi skips the extension and continues). Policy question.
+4. `cargo test --lib` doesn't compile on macOS (`mkfifoat`); `console_input.rs` isn't rustfmt-clean at HEAD.
+
+## Pass 2 roadmap (pi-pretty parity, all native, `interactive_ftui.rs`)
+Shimmer "Working…" sweep with rotating phrases + per-session OKLCH accent hue (djb2 of session name; pi-pretty `session-color.ts`, `working-indicator.ts`) → thinking "Thought for Ns" label reusing the sweep → `read` line-number gutter (`highlight_numbered`, needs the read `offset` on the card) → `❯` prompt icon colored by thinking level. Skip: inline images (needs out-of-band escape writes), FFF search, editor replacement.
+
+## Pi-rust sugar — revised design (session 2, authoritative for the Pass 2 beads)
+
+Decisions taken 2026-09-30: default effect = **single quiet sweep**; effects stay **confined to the
+status line and floating window** (no tool-card settle animation). Everything lives in
+`src/interactive_ftui.rs` (+ a focused submodule only where the bar is genuinely high), pure Rust,
+reusing `DetailBody`, the shared `Arc<SyntaxHighlighter>`, `TerminalSettings`, and the 33 ms frame
+budget. Extensions keep working; the five things below stop needing TS to exist.
+
+### 1. Prompt area as a modular slot framework
+```
+PromptArea { above: Vec<Slot>, editor, status, below: Vec<Slot> }
+Slot { id, order, min_rows, cap_rows, weight, ephemeral, side_ok, float_ok }
+trait SlotProducer { fn render(&self, state: &AppState, width: u16) -> Vec<Line>; fn invalidate(&self); }
+```
+- **One registration path for all metadata extensions.** Native panels (todos, working set,
+  model/dev/flow bars) and TS extension widgets (`ctx.ui.setWidget`, `__colbar.set`) both register a
+  `SlotProducer`; the layout engine places them. Extensions never touch layout.
+- **Placement tiers, re-evaluated every frame:** fullscreen ≥110 cols → right sidebar
+  (`clamp(26, 28% width, 48)`); otherwise weighted columns below the editor; `ephemeral` slots are
+  fillers that yield to heavy content. `/col [next|prev|none|hide|side|float <id>|<id>]` and
+  `ctrl+alt+←/→` ported from `~/.pi/agent-rust/extensions/colbar.ts`.
+- One `layout(width, height) -> Vec<Region>` pass per frame; regions render independently and cache
+  by `(width, content_hash)` so the frame guard never sees them.
+- **Transient floating window.** Any `float_ok` slot can be promoted to an overlay region drawn last
+  (focus it twice, or `/col float <id>`); dismiss on Esc / blur / timeout. Ask cards and the session
+  picker use the same overlay primitive — one z-layer, not three. This is the "context-bound panel"
+  ask: a todo/task/PR flow gets a floating panel for the duration of the flow instead of permanently
+  taking colbar space.
+- `❯` prompt icon colored by thinking level (off/low/medium/high/xhigh → theme ramp), falling back
+  to the per-session OKLCH hue — ships with this step since it's a status-slot detail.
+
+### 2. Shimmer "Working…" indicator
+- Per-session accent: `hue = djb2(session_name) % 360`, OKLCH `(L=0.78, C=0.12, hue)` → sRGB, with a
+  24-bit → 256 → 16 colour fallback chain from terminal caps.
+- Sweep: a 3-cell bright window moving across the phrase at ~12 Hz, driven by the **existing tick** —
+  never its own timer — so it can't fight the frame guard.
+- Rotating phrases from a built-in list (`terminal.workingPhrases` override), rotating every ~3 s,
+  seeded by session hue so two panes don't sync.
+
+### 3. Thinking words — cycling phrases
+A seeded ring of phrases rotates every ~3 s while thinking streams; the shimmer sweep runs over the
+current phrase. On settle the header collapses to `Thought for Ns` in dim text (same clock as the
+`· 1.2s` card elapsed: first thinking delta → first text/tool delta). Expand/collapse of the thinking
+body is the existing card toggle. Built-in list, overridable via `terminal.thinkingPhrases`.
+
+### 4. ttfx integration (https://github.com/omacom/ttfx)
+ttfx is an MIT Rust port of TerminalTextEffects. Candidate **effect engine** behind the
+working/thinking line (`sweep`, `highlight`, `decrypt`, `colorshift`) and floating-window transitions
+(`slide`/`expand` on open, `wipe` on close). Design: an `EffectDriver` trait
+(`next_frame(dt) -> Option<Grid>`) with a ttfx-backed impl, ticked from the frame tick, auto-disabled
+when the frame guard reports pressure or `terminal.effects = false`.
+
+**Gate before adding the dependency** (suite rule against dependency smuggling): verify ttfx exposes
+a `lib` target with a frame API yielding cells/spans rather than ANSI strings, confirm the
+dependency-free claim, and measure binary-size impact against the 48 MiB budget. If there's no usable
+lib API, vendor only the 3–4 needed effects as a focused module with the NOTICE preserved. The
+default sweep must not require ttfx at all.
+
+### 5. Colbar components (native panels)
+Port the panels that depend on TS today: `todos` (built-in `todo` tool state — ephemeral filler),
+`working set`, `modelbar`/`devbar`/`flowbar`-style status strips. Each is a `SlotProducer`.
+Extension-published panels still arrive via `__colbar.set` → `setWidget`, now adopted by the native
+layout instead of a TS HStack.
+
+### Order
+Bugs 1–3 → slot framework (+ prompt icon) → floating overlay/sidebar → ttfx gate → shimmer →
+cycling thinking words → native colbar panels → read gutter. Beads carry the dependency edges.
+
+## Probes (in /tmp, may not survive reboot)
+`/tmp/rpi-probe4.py` (freeze detector: pty, prompt, sample on >4s silence), `/tmp/rpi-quit2.py` (time-to-ready + ctrl+c×2 shutdown time). Both exec `~/.local/bin/rpi` with `PI_PERF_TELEMETRY=1`; `RUST_LOG=ftui_runtime=info` shows the frame-guard decisions in `~/.pi/agent-rust/logs/tui.log`.
