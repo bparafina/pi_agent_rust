@@ -85,6 +85,20 @@ in `PolicyCheck`:
 
 ## Extension Loading Failures
 
+### Symptom: "Extension `<id>` failed to load and was skipped: …" at startup
+
+**Cause**: One extension's entry file could not be evaluated — an import the
+runtime cannot resolve, syntax the engine lacks, a missing shim export. By
+default the session still starts without that extension and reports it with
+one line per failure (the same thing TypeScript pi does). Everything else that
+loaded is live.
+
+**Fix**: Remove or update the named package, or report the shim gap. To make a
+load failure abort session creation instead (strict mode):
+```json
+{ "extensionPolicy": { "failClosedLoad": true } }
+```
+
 ### Symptom: "Do I need to convert JS extensions to descriptors first?"
 
 **Answer**: No. Legacy `.js/.ts` extensions run directly in the embedded

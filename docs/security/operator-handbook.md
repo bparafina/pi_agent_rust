@@ -87,7 +87,8 @@ export PI_EXTENSION_POLICY=safe
 {
   "extensionPolicy": {
     "profile": "safe",
-    "allowDangerous": false
+    "allowDangerous": false,
+    "failClosedLoad": false
   }
 }
 ```
@@ -95,6 +96,9 @@ export PI_EXTENSION_POLICY=safe
 **Resolution order:** CLI > env var > config file > default (`safe`).
 
 Unknown profile names fail closed to `safe` (invariant INV-006).
+
+`failClosedLoad` (default `false`) decides what one broken extension does to
+session creation: skipped and reported at startup, or a hard error.
 
 ### Inspecting Effective Policy
 
