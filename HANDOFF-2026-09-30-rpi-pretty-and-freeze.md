@@ -22,18 +22,18 @@ Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs`.
   `todo_tool_end_feeds_the_todos_slot_and_footer`. Pure/simulator-based; run on the Linux lane (bug 4 on macOS).
 
 ### Next agent, step 1 — confirm the tree compiles
-A second `cargo check --locked --bin pi` was started AFTER all edits above (job log
-`~/.pi/agent-rust/tool-output-artifacts/jobs/job-45644be6d88842179f60996442080253.log`, grep'd to `src/interactive_ftui`
-+ `error` lines, ends with `EXIT n`). Read it; if the session died first, re-run the command. Likely nits if any:
-`Placement` needs `Copy` for the `placement_name` closure (it is `Copy`); `matches!(cmd, ColCommand::Next)` after
-moving `cmd` into the match — if E0382, bind `forward` before the `match`.
-Then `cargo check --locked --all-targets --message-format short` for the test module (the `/col` test uses
-`sim.model_mut().input.set_text` + Enter like `catalog_routes_shift_enter_newline_and_ctrl_d_exit`).
+`cargo check --locked --bin pi` after all edits: **CLEAN (EXIT 0)**, verified this session.
+In flight (read the logs; each ends with `EXIT n`):
+- `cargo check --locked --all-targets` (test crates): `~/.pi/agent-rust/tool-output-artifacts/jobs/job-5e510482cc20431db4ac76e657a49968.log`
+- Release build in the worktree at `818a23560`: `~/.pi/agent-rust/tool-output-artifacts/jobs/job-d4383b0bc633432a84ebcdc73a374cff.log`,
+  binary → `/tmp/pi-release-wt/target/release/pi` (cold cache, ~40+ min, `nice -n 10`).
+If the all-targets check fails inside the new tests, likely nits: the `/col` test uses `sim.model_mut().input.set_text` +
+Enter like `catalog_routes_shift_enter_newline_and_ctrl_d_exit`; `transcript[before..]` needs `TranscriptEntry.text` (it exists).
 
-### Step 2 — release build + live verify (carried from sessions 6/7; never completed)
-Both prior background builds died with their sessions; `/tmp/pi-release-wt/target/release/pi` does NOT exist.
-Re-run in the worktree (`cd /tmp/pi-release-wt && git checkout <this commit> && cargo build --locked --release --bin pi`),
-expect ~40+ min cold. Then the install recipe + `/tmp/rpi-extfail-probe.py`, rename `zz-broken-probe.ts` → `.disabled`,
+### Step 2 — release build + live verify (carried from sessions 6/7)
+Once the worktree build above lands:
+`cp /tmp/pi-release-wt/target/release/pi ~/.local/bin/pi-rust.new && mv -f ~/.local/bin/pi-rust.new ~/.local/bin/pi-rust`,
+then `python3 /tmp/rpi-extfail-probe.py`, rename `~/.pi/agent-rust/extensions/zz-broken-probe.ts` → `.disabled`,
 `/tmp/rpi-quit2.py`, `/tmp/rpi-probe4.py`. Live-check `/col`, `/col float todos`, Esc, and the todo footer with the
 `todo` tool. The worktree removal needs the user's OK (Rule 1).
 
