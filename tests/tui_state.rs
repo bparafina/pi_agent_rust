@@ -2180,6 +2180,7 @@ fn tui_state_terminal_show_images_false_hides_images_in_tool_output() {
         terminal: Some(TerminalSettings {
             show_images: Some(false),
             clear_on_shrink: None,
+            nerd_font_icons: None,
         }),
         ..Config::default()
     };
@@ -2239,6 +2240,7 @@ fn tui_state_terminal_show_images_true_shows_image_placeholders_in_tool_output()
         terminal: Some(TerminalSettings {
             show_images: Some(true),
             clear_on_shrink: None,
+            nerd_font_icons: None,
         }),
         ..Config::default()
     };
@@ -2306,6 +2308,7 @@ fn tui_state_terminal_show_images_false_reports_multiple_hidden_images() {
         terminal: Some(TerminalSettings {
             show_images: Some(false),
             clear_on_shrink: None,
+            nerd_font_icons: None,
         }),
         ..Config::default()
     };
@@ -2368,6 +2371,7 @@ fn tui_state_terminal_show_images_false_still_renders_tool_output_when_only_imag
         terminal: Some(TerminalSettings {
             show_images: Some(false),
             clear_on_shrink: None,
+            nerd_font_icons: None,
         }),
         ..Config::default()
     };
@@ -6232,6 +6236,7 @@ fn tui_grad_image_mixed_content_with_show_images_false_preserves_text() {
         terminal: Some(TerminalSettings {
             show_images: Some(false),
             clear_on_shrink: None,
+            nerd_font_icons: None,
         }),
         ..Config::default()
     };

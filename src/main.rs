@@ -2265,6 +2265,7 @@ async fn run(
                 hide_thinking_block: config.hide_thinking_block.unwrap_or(false),
                 model_names: ftui_model_names,
                 start_in_plan_mode: cli.plan_mode,
+                nerd_font_icons: config.terminal_nerd_font_icons(),
                 double_escape_action: pi::interactive_ftui::DoubleEscapeAction::from_setting(
                     config.double_escape_action.as_deref(),
                 ),

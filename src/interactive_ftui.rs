@@ -881,11 +881,9 @@ fn collapse_detail<'a>(body: &[&'a str]) -> (Vec<&'a str>, usize) {
 #[allow(clippy::too_many_arguments)]
 fn push_card_block(
     lines: &mut Vec<ftui::text::Line<'static>>,
+    entry: &TranscriptEntry,
     state: CardState,
-    text: &str,
-    detail: Option<&String>,
-    diff_styled: bool,
-    group_count: u32,
+    body_style: DetailBody<'_>,
     palette: &FtuiPalette,
     spinner_frame: usize,
     expanded: bool,
@@ -898,57 +896,218 @@ fn push_card_block(
         CardState::Ok => ("✓", ftui::Style::new().fg(palette.accent)),
         CardState::Err => ("✗", ftui::Style::new().bold().fg(palette.error)),
     };
-    let head = if group_count > 1 {
-        format!("{glyph} {text} ×{group_count}")
-    } else {
-        format!("{glyph} {text}")
-    };
-    lines.push(ftui::text::Line::styled(head, style));
-    let Some(detail) = detail else {
-        return;
-    };
     let dim = |s: String| ftui::text::Span::styled(s, ftui::Style::new().dim().fg(palette.muted));
     let added_span = |s: String| ftui::text::Span::styled(s, ftui::Style::new().fg(palette.accent));
     let removed_span =
         |s: String| ftui::text::Span::styled(s, ftui::Style::new().fg(palette.error));
+    let head_text = if entry.group_count > 1 {
+        format!("{glyph} {} ×{}", entry.text, entry.group_count)
+    } else {
+        format!("{glyph} {}", entry.text)
+    };
+    let mut head_spans = vec![ftui::text::Span::styled(head_text, style)];
+    if let Some(code) = entry.exit_code {
+        head_spans.push(ftui::text::Span::styled(
+            format!(" · exit {code}"),
+            ftui::Style::new().fg(palette.error),
+        ));
+    }
+    if state != CardState::Pending
+        && let Some(elapsed) = entry.elapsed
+    {
+        head_spans.push(dim(format!(" · {}", format_elapsed(elapsed))));
+    }
+    lines.push(ftui::text::Line::from_spans(head_spans));
+    let Some(detail) = entry.detail.as_ref() else {
+        return;
+    };
     let all = detail.lines().collect::<Vec<_>>();
     let (body, hidden) = if expanded {
         (all, 0)
     } else {
         collapse_detail(&all)
     };
-    let mut i = 0;
-    while i < body.len() {
-        let line = body[i];
-        // Pair a removed line immediately followed by an added line and
-        // emphasize only the changed middle words (markers kept).
-        if diff_styled
-            && line.starts_with('-')
-            && i + 1 < body.len()
-            && body[i + 1].starts_with('+')
-            && let Some((prefix, rem_mid, add_mid, suffix)) =
-                word_diff_parts(&line[1..], &body[i + 1][1..])
-        {
-            lines.push(ftui::text::Line::from_spans(vec![
-                removed_span(format!("- {prefix}")),
-                removed_span(rem_mid),
-                dim(suffix.clone()),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                added_span(format!("+ {prefix}")),
-                added_span(add_mid),
-                dim(suffix),
-            ]));
-            i += 2;
-            continue;
+    let diff_styled = matches!(body_style, DetailBody::Diff);
+    match body_style {
+        DetailBody::Code(highlighter, lang) => {
+            // Tokenize the body as one unit so multi-line state (block
+            // comments, raw strings) carries across lines. Tool trailers
+            // (`[N more lines in file …]`, `… +N more lines`) aren't source.
+            let joined = body.join("\n");
+            let highlighted = highlighter.highlight(&joined, lang);
+            for (i, line) in body.iter().enumerate() {
+                let is_trailer =
+                    line.starts_with("… +") || (line.starts_with('[') && line.ends_with(']'));
+                match highlighted.lines().get(i) {
+                    Some(styled) if !is_trailer => {
+                        let mut spans = vec![ftui::text::Span::raw("  ")];
+                        spans.extend(styled.spans().iter().map(|span| ftui::text::Span {
+                            content: std::borrow::Cow::Owned(span.content.to_string()),
+                            style: span.style,
+                            link: None,
+                        }));
+                        lines.push(ftui::text::Line::from_spans(spans));
+                    }
+                    _ => lines.push(ftui::text::Line::from_spans(vec![dim(format!("  {line}"))])),
+                }
+            }
         }
-        let span = match diff_styled.then(|| line.as_bytes().first().copied()) {
-            Some(Some(b'+')) => added_span(format!("  {line}")),
-            Some(Some(b'-')) => removed_span(format!("  {line}")),
-            _ => dim(format!("  {line}")),
-        };
-        lines.push(ftui::text::Line::from_spans(vec![span]));
-        i += 1;
+        DetailBody::Find => {
+            let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+            for &line in &body {
+                let is_trailer =
+                    line.starts_with("… +") || line.starts_with('[') || line.is_empty();
+                if is_trailer {
+                    lines.push(ftui::text::Line::from_spans(vec![dim(format!("  {line}"))]));
+                    continue;
+                }
+                let path = std::path::Path::new(line);
+                let dir = match path.parent().and_then(|p| p.to_str()) {
+                    Some(d) if !d.is_empty() => d.to_string(),
+                    _ => ".".to_string(),
+                };
+                let file = path.file_name().and_then(|f| f.to_str()).unwrap_or(line);
+                match groups.iter_mut().find(|(d, _)| d == &dir) {
+                    Some((_, files)) => files.push(file),
+                    None => groups.push((dir, vec![file])),
+                }
+            }
+            for (dir, files) in groups {
+                lines.push(ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled(
+                        format!("  {dir}/"),
+                        ftui::Style::new().bold().fg(palette.accent),
+                    ),
+                ]));
+                for file in files {
+                    lines.push(ftui::text::Line::from_spans(vec![ftui::text::Span::raw(
+                        format!("    {file}"),
+                    )]));
+                }
+            }
+        }
+        DetailBody::Grep(pattern) => {
+            // `path:line: text` (match) or `path-line- text` (context); the
+            // line-number token may carry a hashline tag (`12#ab`).
+            static ROW_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            let row_re = ROW_RE.get_or_init(|| {
+                regex::Regex::new(r"^(.+?)([:-])([0-9][0-9A-Za-z#]*)([:-]) ?(.*)$")
+                    .expect("static grep row pattern")
+            });
+            let mut current_file: Option<&str> = None;
+            for &line in &body {
+                let is_trailer =
+                    line.starts_with("… +") || line.starts_with('[') || line.is_empty();
+                if is_trailer {
+                    lines.push(ftui::text::Line::from_spans(vec![dim(format!("  {line}"))]));
+                    continue;
+                }
+                let Some(caps) = row_re.captures(line) else {
+                    lines.push(ftui::text::Line::from_spans(vec![dim(format!("  {line}"))]));
+                    continue;
+                };
+                let path = caps.get(1).map_or("", |c| c.as_str());
+                let is_context = caps.get(2).is_some_and(|c| c.as_str() == "-");
+                let lineno = caps.get(3).map_or("", |c| c.as_str());
+                let sep = caps.get(4).map_or("", |c| c.as_str());
+                let text = caps.get(5).map_or("", |c| c.as_str());
+                if current_file != Some(path) {
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(
+                            format!("  {path}"),
+                            ftui::Style::new().bold().fg(palette.accent),
+                        ),
+                    ]));
+                    current_file = Some(path);
+                }
+                let mut spans = vec![dim(format!("    {lineno}{sep} "))];
+                if is_context {
+                    spans.push(dim(text.to_string()));
+                } else if let Some(re) = pattern.as_ref() {
+                    let mut last = 0;
+                    for m in re.find_iter(text) {
+                        if m.start() > last {
+                            spans.push(ftui::text::Span::raw(text[last..m.start()].to_string()));
+                        }
+                        spans.push(ftui::text::Span::styled(
+                            text[m.start()..m.end()].to_string(),
+                            ftui::Style::new().bold().fg(palette.warning),
+                        ));
+                        last = m.end();
+                    }
+                    if last < text.len() {
+                        spans.push(ftui::text::Span::raw(text[last..].to_string()));
+                    }
+                } else {
+                    spans.push(ftui::text::Span::raw(text.to_string()));
+                }
+                lines.push(ftui::text::Line::from_spans(spans));
+            }
+        }
+        DetailBody::Listing => {
+            for line in &body {
+                let is_dir = line.ends_with('/');
+                let is_trailer =
+                    line.starts_with("… +") || line.starts_with('[') || line.is_empty();
+                if is_trailer {
+                    lines.push(ftui::text::Line::from_spans(vec![dim(format!("  {line}"))]));
+                    continue;
+                }
+                let icon_style = if is_dir {
+                    ftui::Style::new().fg(palette.accent)
+                } else {
+                    ftui::Style::new().fg(palette.muted)
+                };
+                let name_style = if is_dir {
+                    ftui::Style::new().fg(palette.accent)
+                } else {
+                    ftui::Style::new()
+                };
+                lines.push(ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled(format!("  {} ", file_icon(line)), icon_style),
+                    ftui::text::Span::styled((*line).to_string(), name_style),
+                ]));
+            }
+        }
+        DetailBody::Plain | DetailBody::Diff => {
+            let mut i = 0;
+            while i < body.len() {
+                let line = body[i];
+                // Pair a removed line immediately followed by an added line and
+                // emphasize only the changed middle words (markers kept).
+                if diff_styled
+                    && line.starts_with('-')
+                    && i + 1 < body.len()
+                    && body[i + 1].starts_with('+')
+                    && let Some((prefix, rem_mid, add_mid, suffix)) =
+                        word_diff_parts(&line[1..], &body[i + 1][1..])
+                {
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        removed_span(format!("- {prefix}")),
+                        removed_span(rem_mid),
+                        dim(suffix.clone()),
+                    ]));
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        added_span(format!("+ {prefix}")),
+                        added_span(add_mid),
+                        dim(suffix),
+                    ]));
+                    i += 2;
+                    continue;
+                }
+                let span = match diff_styled.then(|| line.as_bytes().first().copied()) {
+                    Some(Some(b'+')) => added_span(format!("  {line}")),
+                    Some(Some(b'-')) => removed_span(format!("  {line}")),
+                    _ if state == CardState::Err && !diff_styled => ftui::text::Span::styled(
+                        format!("  {line}"),
+                        ftui::Style::new().fg(palette.error),
+                    ),
+                    _ => dim(format!("  {line}")),
+                };
+                lines.push(ftui::text::Line::from_spans(vec![span]));
+                i += 1;
+            }
+        }
     }
     if hidden > 0 {
         lines.push(ftui::text::Line::from_spans(vec![dim(format!(
@@ -1246,6 +1405,132 @@ struct TranscriptEntry {
     /// Grouped consecutive successful runs (read-tool-group parity):
     /// 1 = standalone.
     group_count: u32,
+    /// When the tool card opened.
+    started: Option<Instant>,
+    /// Stamped when the card settles; shown as a dim `· 1.2s` head suffix.
+    elapsed: Option<Duration>,
+    /// Non-zero bash exit status parsed off the `Command exited with code N`
+    /// output trailer.
+    exit_code: Option<i32>,
+}
+
+impl TranscriptEntry {
+    /// How this card's detail lines are styled: diff markers for edits,
+    /// source highlighting for a `read` whose head (the path) has a known
+    /// extension, file-type glyphs for `ls`, dim text otherwise. A grouped
+    /// read card (`read ×N`) has lost its path, so it stays plain.
+    fn detail_body<'a>(
+        &'a self,
+        syntax: &'a ftui_extras::syntax::SyntaxHighlighter,
+        nerd_font_icons: bool,
+    ) -> DetailBody<'a> {
+        if self.diff_styled {
+            return DetailBody::Diff;
+        }
+        match self.tool_name.as_deref() {
+            Some("read") if self.group_count == 1 => std::path::Path::new(&self.text)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .filter(|ext| syntax.supports_language(ext))
+                .map_or(DetailBody::Plain, |ext| DetailBody::Code(syntax, ext)),
+            Some("ls") if nerd_font_icons => DetailBody::Listing,
+            Some("find") => DetailBody::Find,
+            Some("grep") => DetailBody::Grep(self.grep_pattern()),
+            _ => DetailBody::Plain,
+        }
+    }
+
+    /// The grep pattern, recovered from the invocation head (`pattern in scope`
+    /// or bare `pattern`), compiled case-insensitively for match highlighting.
+    /// `None` when it isn't a valid regex.
+    // ponytail: derived from the head text, not the args — a pattern containing
+    // " in " loses its tail. Carry args on ToolStart if it bites.
+    fn grep_pattern(&self) -> Option<regex::Regex> {
+        let head = self.text.strip_suffix('…').unwrap_or(&self.text);
+        let pattern = head
+            .rsplit_once(" in ")
+            .map_or(head, |(pattern, _)| pattern);
+        regex::Regex::new(&format!("(?i){pattern}")).ok()
+    }
+}
+
+/// Styling for a tool card's detail lines (see [`TranscriptEntry::detail_body`]).
+enum DetailBody<'a> {
+    Plain,
+    Diff,
+    /// Highlighter plus the language key (file extension) to tokenize with.
+    Code(&'a ftui_extras::syntax::SyntaxHighlighter, &'a str),
+    Listing,
+    /// find paths grouped under their directory.
+    Find,
+    /// `path:line: text` rows under one header per file, matches emphasized
+    /// when the pattern compiles.
+    Grep(Option<regex::Regex>),
+}
+
+/// Nerd Font glyph for one `ls` entry (directories carry a trailing `/`).
+// ponytail: a dozen common types; extend the match when a glyph is missed.
+fn file_icon(entry: &str) -> &'static str {
+    if entry.ends_with('/') {
+        return "\u{f07b}"; // nf-fa-folder
+    }
+    let name = std::path::Path::new(entry);
+    let ext = name
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("rs") => "\u{e7a8}",                                    // nf-dev-rust
+        Some("py") => "\u{e73c}",                                    // nf-dev-python
+        Some("js" | "mjs" | "cjs") => "\u{e74e}",                    // nf-dev-javascript_badge
+        Some("ts" | "tsx") => "\u{e628}",                            // nf-seti-typescript
+        Some("go") => "\u{e627}",                                    // nf-seti-go
+        Some("java" | "kt") => "\u{e738}",                           // nf-dev-java
+        Some("c" | "h") => "\u{e61e}",                               // nf-custom-c
+        Some("cpp" | "cc" | "hpp") => "\u{e61d}",                    // nf-custom-cpp
+        Some("rb") => "\u{e739}",                                    // nf-dev-ruby
+        Some("html" | "htm") => "\u{e736}",                          // nf-dev-html5
+        Some("css" | "scss") => "\u{e749}",                          // nf-dev-css3
+        Some("md" | "markdown") => "\u{e73e}",                       // nf-dev-markdown
+        Some("json") => "\u{e60b}",                                  // nf-seti-json
+        Some("toml" | "yaml" | "yml" | "ini" | "cfg") => "\u{e615}", // nf-seti-config
+        Some("sh" | "bash" | "zsh" | "fish") => "\u{f489}",          // nf-oct-terminal
+        Some("sql") => "\u{e706}",                                   // nf-dev-database
+        Some("lock") => "\u{f023}",                                  // nf-fa-lock
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg") => "\u{f1c5}", // nf-fa-file_image_o
+        Some("pdf") => "\u{f1c1}",                                   // nf-fa-file_pdf_o
+        Some("zip" | "gz" | "tar" | "tgz" | "xz" | "zst") => "\u{f410}", // nf-oct-file_zip
+        Some("txt" | "log") => "\u{f15c}",                           // nf-fa-file_text
+        _ if entry.starts_with(".git") => "\u{e702}",                // nf-dev-git
+        _ if entry == "Dockerfile" => "\u{f308}",                    // nf-linux-docker
+        _ => "\u{f15b}",                                             // nf-fa-file
+    }
+}
+
+/// `Command exited with code N` trailer the bash tool appends on non-zero
+/// exit: the body without it, plus the code.
+fn split_bash_exit_trailer(output: &str) -> Option<(String, i32)> {
+    let trimmed = output.trim_end();
+    let (body, last) = trimmed.rsplit_once('\n').unwrap_or(("", trimmed));
+    let code = last
+        .strip_prefix("Command exited with code ")?
+        .trim()
+        .parse()
+        .ok()?;
+    Some((body.trim_end().to_string(), code))
+}
+
+/// `820ms` / `1.2s` / `1m04s`.
+fn format_elapsed(elapsed: Duration) -> String {
+    let ms = elapsed.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else {
+        let secs = elapsed.as_secs();
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
 }
 /// An ask-tool card being answered (bd-cv653.3.8), mirroring the inline flow
 /// of the bubbletea stack: the card renders into the transcript and the
@@ -1843,6 +2128,11 @@ pub struct PiFtuiModel {
     last_ctrl_c: Option<std::time::Instant>,
     /// Tool cards show all their kept output (ctrl+o toggles).
     tools_expanded: bool,
+    /// Highlights assistant code fences and `read` card bodies; shared with
+    /// the per-frame markdown renderer.
+    syntax: Arc<ftui_extras::syntax::SyntaxHighlighter>,
+    /// `terminal.nerdFontIcons`: file-type glyphs on `ls` card entries.
+    nerd_font_icons: bool,
     /// Thinking entries show in full rather than as one line (ctrl+t).
     show_thinking: bool,
     /// What double-Esc on an idle, empty editor does.
@@ -2103,6 +2393,8 @@ impl PiFtuiModel {
             pending_task: None,
             last_ctrl_c: None,
             tools_expanded: false,
+            syntax: Arc::new(ftui_extras::syntax::SyntaxHighlighter::new()),
+            nerd_font_icons: false,
             show_thinking: false,
             double_escape_action: DoubleEscapeAction::Rewind,
             last_idle_escape: None,
@@ -2169,6 +2461,12 @@ impl PiFtuiModel {
     #[must_use]
     pub const fn with_markdown_spacing(mut self, spacing: crate::config::MarkdownSpacing) -> Self {
         self.markdown_spacing = spacing;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_nerd_font_icons(mut self, enabled: bool) -> Self {
+        self.nerd_font_icons = enabled;
         self
     }
 
@@ -2492,6 +2790,9 @@ impl PiFtuiModel {
             diff_styled: false,
             tool_name: None,
             group_count: 1,
+            started: None,
+            elapsed: None,
+            exit_code: None,
         });
     }
 
@@ -2606,6 +2907,9 @@ impl PiFtuiModel {
             diff_styled: false,
             tool_name: Some(sanitized_name.to_string()),
             group_count: 1,
+            started: Some(Instant::now()),
+            elapsed: None,
+            exit_code: None,
         });
     }
     /// Close the last pending tool card named `sanitized_name`, falling
@@ -2645,9 +2949,21 @@ impl PiFtuiModel {
         let revision = self.next_revision();
         self.transcript[idx].card = Some(if ok { CardState::Ok } else { CardState::Err });
         self.transcript[idx].revision = revision;
+        self.transcript[idx].elapsed = self.transcript[idx].started.map(|s| s.elapsed());
         if let Some(output) = sanitized_output {
-            self.transcript[idx].detail = Some(output);
+            let (detail, exit_code) = if display_name == "bash" {
+                match split_bash_exit_trailer(&output) {
+                    Some((body, code)) => {
+                        (if body.is_empty() { None } else { Some(body) }, Some(code))
+                    }
+                    None => (Some(output), None),
+                }
+            } else {
+                (Some(output), None)
+            };
+            self.transcript[idx].detail = detail;
             self.transcript[idx].diff_styled = diff_styled;
+            self.transcript[idx].exit_code = exit_code;
         }
         // Read-call grouping (bd-cv653.9.2, read-tool-group parity): a
         // successful read DIRECTLY following another successful read card
@@ -4992,6 +5308,7 @@ impl PiFtuiModel {
         // and its cells were clipped mid-column).
         let theme = ftui_extras::markdown::MarkdownTheme::default();
         let md = ftui_extras::markdown::MarkdownRenderer::new(theme.clone())
+            .with_syntax_highlighter(Arc::clone(&self.syntax))
             .table_max_width(Self::table_width_for(width));
         let palette = self.palette;
         let compact = self.markdown_spacing == crate::config::MarkdownSpacing::Compact;
@@ -5026,11 +5343,9 @@ impl PiFtuiModel {
                 let mut block_lines: Vec<ftui::text::Line<'static>> = Vec::new();
                 push_card_block(
                     &mut block_lines,
+                    entry,
                     CardState::Pending,
-                    &entry.text,
-                    entry.detail.as_ref(),
-                    entry.diff_styled,
-                    entry.group_count,
+                    entry.detail_body(&self.syntax, self.nerd_font_icons),
                     &palette,
                     self.spinner.current_frame,
                     self.tools_expanded,
@@ -5051,11 +5366,9 @@ impl PiFtuiModel {
             if let Some(state) = entry.card {
                 push_card_block(
                     &mut block_lines,
+                    entry,
                     state,
-                    &entry.text,
-                    entry.detail.as_ref(),
-                    entry.diff_styled,
-                    entry.group_count,
+                    entry.detail_body(&self.syntax, self.nerd_font_icons),
                     &palette,
                     self.spinner.current_frame,
                     self.tools_expanded,
@@ -8225,6 +8538,8 @@ pub struct FtuiSettings {
     pub model_names: HashMap<String, String>,
     /// `--plan-mode`: start in planning, as the classic stack does.
     pub start_in_plan_mode: bool,
+    /// The `terminal.nerdFontIcons` setting.
+    pub nerd_font_icons: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8249,6 +8564,7 @@ pub fn run(
         double_escape_action,
         model_names,
         start_in_plan_mode,
+        nerd_font_icons,
     } = settings;
     let driver_btw_client = btw_client.clone();
     let mut cycle_models = if cycle_models.is_empty() {
@@ -8871,6 +9187,7 @@ pub fn run(
         .with_alt_screen(!inline)
         .with_mouse_enabled(!disable_mouse_capture)
         .with_markdown_spacing(markdown_spacing)
+        .with_nerd_font_icons(nerd_font_icons)
         .with_thinking_visible(!hide_thinking_block)
         .with_double_escape_action(double_escape_action)
         .with_autocomplete(autocomplete)
@@ -8878,11 +9195,28 @@ pub fn run(
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen
     // remains the default.
+    //
+    // Frame budget: never let the runtime skip frames. ftui-runtime 0.7's
+    // conformal frame guard degrades `Full → … → SkipFrame` within ~400ms
+    // of ONE slow frame (a 25ms frame against the 16ms default, seen during
+    // streaming turns), and at `SkipFrame` no frame renders, so no new
+    // timing sample ever displaces the slow one — the gate re-fires every
+    // frame and the screen stays frozen on the last paint while the agent
+    // keeps working. With frame skipping disallowed the worst level still
+    // paints, timings keep flowing, and the cascade recovers on its own.
+    // 33ms (~30fps) is plenty for a transcript and stops ordinary
+    // markdown re-layouts from tripping the guard at all.
+    let budget = ftui::render::budget::FrameBudgetConfig {
+        total: Duration::from_millis(33),
+        allow_frame_skip: false,
+        ..Default::default()
+    };
     let app = if inline {
         ftui::App::inline_auto(model, INLINE_MIN_HEIGHT, INLINE_MAX_HEIGHT)
     } else {
         ftui::App::fullscreen(model)
-    };
+    }
+    .with_budget(budget);
     // Divert tracing output away from the terminal while the TUI owns it
     // (bd-trkef); restored on drop.
     let log_guard = crate::tui::TuiLogRedirectGuard::begin();
@@ -14607,6 +14941,190 @@ mod tests {
         let closed = layout_regions(area, 1, 0, 0);
         assert_eq!(closed.completion.height, 0);
         assert_eq!(closed.body.height, regions.body.height + 4);
+    }
+
+    #[test]
+    fn read_card_body_is_syntax_highlighted_and_ls_card_gets_icons() {
+        let (_tx, model) = new_model();
+        let model = model.with_nerd_font_icons(true);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "read".into(),
+            tool_id: "t1".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolInvocation {
+            tool_id: "t1".into(),
+            summary: "src/main.rs".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "read".into(),
+            tool_id: "t1".into(),
+            is_error: false,
+            output: Some(
+                "fn main() {}\n\n[3 more lines in file. Use offset=2 to continue.]".into(),
+            ),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "ls".into(),
+            tool_id: "t2".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "ls".into(),
+            tool_id: "t2".into(),
+            is_error: false,
+            output: Some("src/\nCargo.toml".into()),
+        }));
+        let text = sim.model().conversation_text(80);
+        let line_of = |needle: &str| {
+            text.lines()
+                .iter()
+                .find(|l| l.spans().iter().any(|s| s.content.contains(needle)))
+                .unwrap_or_else(|| panic!("no line containing {needle:?}"))
+        };
+        // `fn` and `main` tokenize to different styles: the body went
+        // through the highlighter, not the dim fallback.
+        let code = line_of("main");
+        let styles: std::collections::HashSet<_> = code
+            .spans()
+            .iter()
+            .filter(|s| !s.content.trim().is_empty())
+            .map(|s| format!("{:?}", s.style))
+            .collect();
+        assert!(styles.len() > 1, "read body not highlighted: {code:?}");
+        // The trailer stays a single dim line, never tokenized as code.
+        assert_eq!(line_of("more lines in file").spans().len(), 1);
+        // Icons: folder glyph before the directory, file glyph before the file.
+        assert!(line_of("src/").spans()[0].content.contains('\u{f07b}'));
+        assert!(
+            line_of("Cargo.toml").spans()[0]
+                .content
+                .contains('\u{e615}')
+        );
+    }
+
+    #[test]
+    fn tool_cards_show_exit_code_elapsed_grep_and_find_grouping() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+
+        // Failed bash card: the trailer becomes an exit-code head suffix,
+        // not body text, and elapsed shows once the card settles.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "bash".into(),
+            tool_id: "b1".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "bash".into(),
+            tool_id: "b1".into(),
+            is_error: true,
+            output: Some("boom\n\nCommand exited with code 2".into()),
+        }));
+
+        // Grep card: one header per file, matches highlighted.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "grep".into(),
+            tool_id: "g1".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolInvocation {
+            tool_id: "g1".into(),
+            summary: "needle in src".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "grep".into(),
+            tool_id: "g1".into(),
+            is_error: false,
+            output: Some(
+                "src/a.rs:3: let needle = 1;\nsrc/a.rs-4- next\nsrc/b.rs:9: needle()".into(),
+            ),
+        }));
+
+        // Find card: paths grouped under their directory.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "find".into(),
+            tool_id: "f1".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "find".into(),
+            tool_id: "f1".into(),
+            is_error: false,
+            output: Some("src/a.rs\nsrc/b.rs\nCargo.toml".into()),
+        }));
+
+        let text = sim.model().conversation_text(80);
+        let lines = text.lines();
+
+        // Bash: exit code on the head, no raw trailer text, elapsed shown.
+        let bash_head = lines
+            .iter()
+            .find(|l| l.spans().iter().any(|s| s.content.contains("exit 2")))
+            .expect("bash head shows exit code");
+        assert!(
+            bash_head
+                .spans()
+                .iter()
+                .any(|s| { s.content.contains("ms") || s.content.contains('s') })
+                && bash_head
+                    .spans()
+                    .iter()
+                    .any(|s| s.content.contains('\u{b7}')),
+            "bash head shows elapsed: {bash_head:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l
+                .spans()
+                .iter()
+                .any(|s| s.content.contains("Command exited"))),
+            "trailer must not leak into the body"
+        );
+
+        // Grep: exactly one header line for src/a.rs, a highlighted match
+        // row, and a header for src/b.rs.
+        let a_headers: Vec<_> = lines
+            .iter()
+            .filter(|l| l.spans().len() == 1 && l.spans()[0].content.ends_with("src/a.rs"))
+            .collect();
+        assert_eq!(a_headers.len(), 1, "one header for src/a.rs: {lines:?}");
+        let highlighted_match = lines
+            .iter()
+            .find(|l| l.spans().len() > 1 && l.spans().iter().any(|s| s.content == "needle"));
+        assert!(
+            highlighted_match.is_some(),
+            "needle split into its own span"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans().len() == 1 && l.spans()[0].content.ends_with("src/b.rs")),
+            "header for src/b.rs"
+        );
+
+        // Find: paths grouped under their directory.
+        let has_span = |needle: &str| {
+            lines
+                .iter()
+                .any(|l| l.spans().iter().any(|s| s.content == needle))
+        };
+        assert!(has_span("  src/"));
+        assert!(has_span("    a.rs"));
+        assert!(has_span("    b.rs"));
+        assert!(has_span("  ./"));
+        assert!(has_span("    Cargo.toml"));
+    }
+
+    #[test]
+    fn split_bash_exit_trailer_and_format_elapsed() {
+        assert_eq!(
+            split_bash_exit_trailer("out\n\nCommand exited with code 7"),
+            Some((String::from("out"), 7))
+        );
+        assert_eq!(split_bash_exit_trailer("ok"), None);
+        assert_eq!(format_elapsed(Duration::from_millis(820)), "820ms");
+        assert_eq!(format_elapsed(Duration::from_millis(1234)), "1.2s");
+        assert_eq!(format_elapsed(Duration::from_secs(64)), "1m04s");
     }
 
     #[test]

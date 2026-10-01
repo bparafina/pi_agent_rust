@@ -660,6 +660,10 @@ pub struct TerminalSettings {
     pub show_images: Option<bool>,
     #[serde(alias = "clearOnShrink")]
     pub clear_on_shrink: Option<bool>,
+    /// Prefix `ls` card entries with Nerd Font file-type glyphs. Off by
+    /// default: without a patched font they render as tofu.
+    #[serde(alias = "nerdFontIcons")]
+    pub nerd_font_icons: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1212,6 +1216,14 @@ impl Config {
             .as_ref()
             .and_then(|t| t.show_images)
             .unwrap_or(true)
+    }
+
+    #[must_use]
+    pub fn terminal_nerd_font_icons(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .and_then(|t| t.nerd_font_icons)
+            .unwrap_or(false)
     }
 
     pub fn terminal_clear_on_shrink(&self) -> bool {
@@ -2212,6 +2224,7 @@ fn merge_terminal(
         (Some(base), Some(other)) => Some(TerminalSettings {
             show_images: other.show_images.or(base.show_images),
             clear_on_shrink: other.clear_on_shrink.or(base.clear_on_shrink),
+            nerd_font_icons: other.nerd_font_icons.or(base.nerd_font_icons),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -4711,8 +4724,8 @@ mod tests {
                 o_show in prop::option::of(any::<bool>()),
                 o_clear in prop::option::of(any::<bool>()),
             ) {
-                let base = TerminalSettings { show_images: b_show, clear_on_shrink: b_clear };
-                let other = TerminalSettings { show_images: o_show, clear_on_shrink: o_clear };
+                let base = TerminalSettings { show_images: b_show, clear_on_shrink: b_clear, nerd_font_icons: None };
+                let other = TerminalSettings { show_images: o_show, clear_on_shrink: o_clear, nerd_font_icons: None };
                 let result = merge_terminal(Some(base), Some(other)).unwrap();
                 assert_eq!(result.show_images, o_show.or(b_show));
                 assert_eq!(result.clear_on_shrink, o_clear.or(b_clear));

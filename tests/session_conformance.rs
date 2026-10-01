@@ -1138,3 +1138,28 @@ fn save_preserves_message_timestamps() {
         }
     });
 }
+
+/// Regression for the false "conflicting persisted and in-memory payloads"
+/// quarantine (handoff 2026-09-30, bug 1): a completed assistant entry with a
+/// signature-only thinking block, a tool call, and Bedrock usage/cost fields
+/// must serialize identically before and after a disk round-trip, otherwise
+/// `prepare_jsonl_full_rewrite` rejects an unchanged entry on retry.
+#[test]
+fn assistant_entry_serialization_is_stable_across_disk_round_trip() {
+    let line = r#"{"type":"message","id":"37793397","parentId":"10fc95c7","timestamp":"2026-10-01T01:29:09.743Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","thinkingSignature":"CAQSqQYKEgg"},{"type":"toolCall","id":"tooluse_Z6uOLQJt0NgzxmuFucb3OW","name":"bash","arguments":{"command":"ls ~/.cargo/bin"}}],"api":"bedrock-converse-stream","provider":"amazon-bedrock","model":"us.anthropic.claude-fable-5-1","usage":{"input":2,"output":231,"cacheRead":104580,"cacheWrite":1146,"totalTokens":105959,"cost":{"input":0.000022,"output":0.012705000000000001,"cacheRead":0.0287595,"cacheWrite":0.0157575,"total":0.057244}},"stopReason":"toolUse","timestamp":1790818080370}}"#;
+    let first: SessionEntry = serde_json::from_str(line).expect("parse repro line");
+    let first_bytes = serde_json::to_vec(&first).expect("serialize once");
+    let second: SessionEntry =
+        serde_json::from_slice(&first_bytes).expect("re-parse serialized entry");
+    let second_bytes = serde_json::to_vec(&second).expect("serialize twice");
+    assert_eq!(
+        String::from_utf8_lossy(&first_bytes),
+        String::from_utf8_lossy(&second_bytes),
+        "assistant entry must round-trip byte-stably"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&first_bytes),
+        line,
+        "re-serialized entry must match the persisted line"
+    );
+}

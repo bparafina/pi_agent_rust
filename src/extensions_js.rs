@@ -9128,6 +9128,13 @@ export class Container {
   constructor(..._args) {}
 }
 
+// Layout stacks: this host renders natively and never lays extension
+// components out, so these only need to exist for extensions that import
+// them (a missing export fails the whole extension at load).
+export class HStack extends Container {}
+
+export class VStack extends Container {}
+
 export class Markdown {
   constructor(..._args) {}
 }
@@ -9418,7 +9425,7 @@ export class Image {
   }
 }
 
-export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, TruncatedText, Container, Markdown, Spacer, Editor, Box, SelectList, Input, ProcessTerminal, Image, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter, CancellableLoader };
+export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, TruncatedText, Container, HStack, VStack, Markdown, Spacer, Editor, Box, SelectList, Input, ProcessTerminal, Image, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter, CancellableLoader };
 "#)
         .trim()
         .to_string(),

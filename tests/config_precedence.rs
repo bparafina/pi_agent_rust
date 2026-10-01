@@ -271,6 +271,7 @@ fn config_terminal_defaults_and_overrides() {
         terminal: Some(TerminalSettings {
             show_images: Some(false),
             clear_on_shrink: Some(true),
+            nerd_font_icons: None,
         }),
         ..Config::default()
     };

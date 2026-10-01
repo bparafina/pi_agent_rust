@@ -345,10 +345,21 @@ impl BedrockProvider {
             });
         }
 
-        let mut messages = Vec::new();
+        let mut messages: Vec<BedrockMessage> = Vec::new();
         for message in context.messages.iter() {
             if let Some(converted) = convert_message(message) {
-                messages.push(converted);
+                // Converse requires strict role alternation, with every
+                // toolResult for an assistant turn inside the ONE following
+                // user message. Pi stores each tool result as its own
+                // message, so parallel tool calls arrive as consecutive user
+                // messages; unmerged, Bedrock rejects the request with
+                // "Expected toolResult blocks at messages.N.content".
+                match messages.last_mut() {
+                    Some(last) if last.role == converted.role => {
+                        last.content.extend(converted.content);
+                    }
+                    _ => messages.push(converted),
+                }
             }
         }
 
@@ -1615,6 +1626,42 @@ mod tests {
             value["toolConfig"]["tools"][0]["toolSpec"]["name"],
             "search"
         );
+    }
+
+    #[test]
+    fn build_request_folds_parallel_tool_results_into_one_user_message() {
+        // Regression: two tool results after one assistant turn used to become
+        // two consecutive `user` messages, which Converse rejects with
+        // "Expected toolResult blocks at messages.2.content for ... Ids".
+        let mut context = test_context_with_tools();
+        let mut messages = context.messages.to_vec();
+        messages.push(Message::tool_result(ToolResultMessage {
+            tool_call_id: "tool_2".to_string(),
+            tool_name: "search".to_string(),
+            content: vec![ContentBlock::Text(TextContent {
+                text: "second".to_string(),
+                text_signature: None,
+            })],
+            details: None,
+            is_error: true,
+            timestamp: 0,
+        }));
+        context.messages = messages.into();
+
+        let request = BedrockProvider::build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        let roles: Vec<_> = value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"], "roles must alternate");
+        let results = value["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["toolResult"]["toolUseId"], "tool_1");
+        assert_eq!(results[1]["toolResult"]["toolUseId"], "tool_2");
+        assert_eq!(results[1]["toolResult"]["status"], "error");
     }
 
     #[test]

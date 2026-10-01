@@ -237,7 +237,13 @@ portable-pty = "0.9"
 
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["raw_value"] }
+# `float_roundtrip`: the default parser is best-effort precision, so a computed
+# cost like 0.012705000000000001 re-parsed from the session JSONL came back as
+# 0.012705. `prepare_jsonl_full_rewrite` byte-compares re-parsed disk entries
+# against in-memory ones and reported an unchanged assistant entry as
+# "conflicting persisted and in-memory payloads", quarantining provider
+# re-entry for the rest of the session (handoff 2026-09-30, bug 1).
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
 json5 = "1.3.1"
 
 # Error handling
@@ -278,7 +284,9 @@ ftui = { version = "0.7", default-features = false, features = ["runtime", "cros
 # Markdown rendering for the ftui conversation view. Direct dep because the
 # facade's `extras` feature enables no ftui-extras features (markdown stays
 # off); default-features off keeps the heavy extras (charts, doom, ...) out.
-ftui-extras = { version = "0.7", default-features = false, features = ["markdown"], optional = true }
+# `syntax` is ftui's own tokenizer set (no syntect): highlights assistant
+# code fences and `read` card bodies.
+ftui-extras = { version = "0.7", default-features = false, features = ["markdown", "syntax"], optional = true }
 
 # Filesystem
 dirs = "6"
