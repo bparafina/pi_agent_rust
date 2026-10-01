@@ -8750,10 +8750,7 @@ async fn create_driver_session(
     session_options.runtime_handle = Some(runtime_handle.clone());
     spawn_ext_reply_pump(Arc::clone(&ext_handler), ext_reply_rx, runtime_handle);
     match crate::sdk::create_agent_session(session_options).await {
-        Ok(handle) => {
-            report_extension_load_failures(&handle, agent_tx);
-            Some((handle, ext_handler))
-        }
+        Ok(handle) => Some((handle, ext_handler)),
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("session: {err}")));
             None
@@ -8968,6 +8965,12 @@ pub fn run(
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
                 send_conversation_reset(&handle, &agent_tx, "pi interactive stack").await;
+                // After the reset, not before: `ConversationReset` rebuilds the
+                // transcript from the session file, so a System line sent
+                // ahead of it is wiped milliseconds later. Observed live with
+                // a deliberately broken extension: the runtime logged
+                // `ext.load.skipped`, the transcript showed nothing.
+                report_extension_load_failures(&handle, &agent_tx);
                 Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                 // Issue #208: extension-contributed slash commands become
                 // completable now that the extension runtime is up.
@@ -14093,6 +14096,42 @@ mod tests {
                 .iter()
                 .any(|e| e.text.contains("Usage: /tan")),
             "the refusal must say how to use it"
+        );
+    }
+
+    /// The startup `ConversationReset` rebuilds the transcript from the session
+    /// file, so a System line must be sent AFTER it to be seen. The driver
+    /// reports skipped extensions after the reset for exactly this reason;
+    /// live, the line sent before it vanished while the runtime log said
+    /// `ext.load.skipped`.
+    #[test]
+    fn a_system_line_sent_before_the_startup_reset_is_wiped_and_one_after_survives() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::System(
+            "Extension early failed to load and was skipped: boom".to_string(),
+        )));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: "s1".to_string(),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: Some("pi interactive stack".to_string()),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::System(
+            "Extension late failed to load and was skipped: boom".to_string(),
+        )));
+
+        let transcript = &sim.model().transcript;
+        assert!(
+            !transcript.iter().any(|e| e.text.contains("Extension early")),
+            "the reset rebuilds the transcript; anything sent ahead of it is gone"
+        );
+        assert!(
+            transcript
+                .iter()
+                .any(|e| e.role == EntryRole::System && e.text.contains("Extension late")),
+            "a skip line sent after the reset is what the user sees"
         );
     }
 
