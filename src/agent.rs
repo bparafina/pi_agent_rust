@@ -19137,6 +19137,7 @@ mod tests {
                 profile: None,
                 default_permissive: Some(false),
                 allow_dangerous: None,
+                fail_closed_load: None,
             }),
             ..Default::default()
         };
@@ -19151,6 +19152,7 @@ mod tests {
                 profile: None,
                 default_permissive: Some(false),
                 allow_dangerous: None,
+                fail_closed_load: None,
             }),
             ..Default::default()
         };

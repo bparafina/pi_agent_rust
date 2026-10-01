@@ -2954,6 +2954,20 @@ impl ExtensionManager {
         guard.host_actions.clone()
     }
 
+    /// Extensions the most recent load skipped instead of installing.
+    ///
+    /// Empty under [`ExtensionPolicy::fail_closed_load`], because there the
+    /// load itself fails. A surface should show these once at startup: the
+    /// alternative is a user who removed nothing, sees no error, and only
+    /// later notices a slash command is missing.
+    pub fn load_failures(&self) -> Vec<ExtensionLoadFailure> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .load_failures
+            .clone()
+    }
+
     #[allow(clippy::significant_drop_tightening)]
     pub fn cached_policy_prompt_decision(
         &self,
@@ -3168,7 +3182,10 @@ impl ExtensionManager {
             None
         };
 
-        let snapshots = runtime.load_js_extensions_snapshots(specs).await?;
+        let JsExtensionLoadReport {
+            snapshots,
+            failures: load_failures,
+        } = runtime.load_js_extensions_snapshots(specs).await?;
 
         let mut payloads = Vec::new();
         let mut extension_ids = Vec::new();
@@ -3262,6 +3279,7 @@ impl ExtensionManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.extensions = payloads;
             guard.extension_ids = extension_ids;
+            guard.load_failures = load_failures;
             guard.extension_roots = extension_roots;
             guard.extension_versions = extension_versions;
             guard.active_tools = active_tools;

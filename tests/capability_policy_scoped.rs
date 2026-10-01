@@ -173,6 +173,7 @@ mod config_resolution {
                 profile: Some("safe".to_string()),
                 default_permissive: None,
                 allow_dangerous: None,
+                fail_closed_load: None,
             }),
             ..Default::default()
         };
@@ -187,6 +188,7 @@ mod config_resolution {
                 profile: Some("safe".to_string()),
                 default_permissive: None,
                 allow_dangerous: None,
+                fail_closed_load: None,
             }),
             ..Default::default()
         };
@@ -202,6 +204,7 @@ mod config_resolution {
                 profile: None,
                 default_permissive: Some(false),
                 allow_dangerous: Some(true),
+                fail_closed_load: None,
             }),
             ..Default::default()
         };
@@ -223,6 +226,7 @@ mod config_resolution {
                 profile: None,
                 default_permissive: Some(false),
                 allow_dangerous: Some(false),
+                fail_closed_load: None,
             }),
             ..Default::default()
         };
@@ -239,6 +243,7 @@ mod config_resolution {
                 profile: Some("safe".to_string()),
                 default_permissive: None,
                 allow_dangerous: Some(true),
+                fail_closed_load: None,
             }),
             ..Default::default()
         };
@@ -314,6 +319,7 @@ mod config_deserialization {
                 profile: Some("safe".to_string()),
                 default_permissive: Some(false),
                 allow_dangerous: Some(true),
+                fail_closed_load: None,
             }),
             ..Default::default()
         };

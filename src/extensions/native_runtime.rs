@@ -1,9 +1,9 @@
 //! Active deterministic native descriptor extension runtime.
 
 use super::{
-    Error, ExtensionRepairEvent, ExtensionToolDef, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
-    JsExtensionSnapshot, NativeRustExtensionLoadSpec, Result, extract_slash_command_name,
-    parse_extension_tool_defs,
+    Error, ExtensionRepairEvent, ExtensionToolDef, JsExtensionLoadReport, JsExtensionLoadSpec,
+    JsExtensionRuntimeHandle, JsExtensionSnapshot, NativeRustExtensionLoadSpec, Result,
+    extract_slash_command_name, parse_extension_tool_defs,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -672,7 +672,7 @@ impl ExtensionRuntimeHandle {
     pub(super) async fn load_js_extensions_snapshots(
         &self,
         specs: Vec<JsExtensionLoadSpec>,
-    ) -> Result<Vec<JsExtensionSnapshot>> {
+    ) -> Result<JsExtensionLoadReport> {
         match self {
             Self::Js(runtime) => runtime.load_extensions_snapshots(specs).await,
             Self::NativeRust(_) => Err(Error::extension(

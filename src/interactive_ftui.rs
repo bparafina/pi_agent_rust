@@ -8491,11 +8491,38 @@ async fn create_driver_session(
     session_options.runtime_handle = Some(runtime_handle.clone());
     spawn_ext_reply_pump(Arc::clone(&ext_handler), ext_reply_rx, runtime_handle);
     match crate::sdk::create_agent_session(session_options).await {
-        Ok(handle) => Some((handle, ext_handler)),
+        Ok(handle) => {
+            report_extension_load_failures(&handle, agent_tx);
+            Some((handle, ext_handler))
+        }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("session: {err}")));
             None
         }
+    }
+}
+
+/// Say which extensions the session came up without.
+///
+/// With `extension_policy.failClosedLoad` off (the default) a broken extension
+/// is skipped rather than aborting session creation; without this line the
+/// only evidence would be a slash command that silently does not exist. One
+/// line per failure, because the fix is per extension: remove it, update it,
+/// or report the shim gap.
+fn report_extension_load_failures(
+    handle: &crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let Some(manager) = handle.extension_manager() else {
+        return;
+    };
+    for failure in manager.load_failures() {
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "Extension {} failed to load and was skipped: {} ({})",
+            failure.extension_id,
+            failure.message,
+            failure.entry_path.display()
+        )));
     }
 }
 

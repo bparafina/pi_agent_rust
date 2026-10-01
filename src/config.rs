@@ -300,6 +300,10 @@ pub struct ExtensionPolicyConfig {
     /// Allow dangerous capabilities (exec, env). Overrides profile's deny list.
     #[serde(alias = "allowDangerous")]
     pub allow_dangerous: Option<bool>,
+    /// Abort session creation when any one extension fails to load. Off by
+    /// default: a broken extension is skipped and reported at startup.
+    #[serde(alias = "failClosedLoad")]
+    pub fail_closed_load: Option<bool>,
 }
 
 /// Repair policy configuration.
@@ -1400,6 +1404,11 @@ impl Config {
         if allow_dangerous {
             policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
         }
+        policy.fail_closed_load = self
+            .extension_policy
+            .as_ref()
+            .and_then(|p| p.fail_closed_load)
+            .unwrap_or(false);
 
         let effective_profile = effective_profile_str(profile);
 
@@ -2260,6 +2269,7 @@ fn merge_extension_policy(
             profile: other.profile.or(base.profile),
             default_permissive: other.default_permissive.or(base.default_permissive),
             allow_dangerous: other.allow_dangerous.or(base.allow_dangerous),
+            fail_closed_load: other.fail_closed_load.or(base.fail_closed_load),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -3748,6 +3758,7 @@ mod tests {
                 profile: None,
                 default_permissive: Some(false),
                 allow_dangerous: None,
+                fail_closed_load: None,
             }),
             ..Default::default()
         };
@@ -4779,11 +4790,13 @@ mod tests {
                     profile: b_profile.clone(),
                     default_permissive: b_default_permissive,
                     allow_dangerous: b_danger,
+                    fail_closed_load: None,
                 };
                 let other = ExtensionPolicyConfig {
                     profile: o_profile.clone(),
                     default_permissive: o_default_permissive,
                     allow_dangerous: o_danger,
+                    fail_closed_load: None,
                 };
                 let result = merge_extension_policy(Some(base), Some(other)).unwrap();
                 assert_eq!(result.profile, o_profile.or(b_profile));

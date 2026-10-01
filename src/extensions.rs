@@ -20195,6 +20195,10 @@ struct ExtensionManagerInner {
     /// Runtime principal for each `extensions` entry at the same index.
     /// Display names are intentionally kept separate from security identity.
     extension_ids: Vec<String>,
+    /// Extensions skipped by the most recent load (see
+    /// [`ExtensionPolicy::fail_closed_load`]). Replaced wholesale on every
+    /// load so a reload that fixes an extension clears its entry.
+    load_failures: Vec<ExtensionLoadFailure>,
     extension_roots: Vec<PathBuf>,
     extension_versions: HashMap<String, String>,
     runtime: Option<ExtensionRuntimeHandle>,

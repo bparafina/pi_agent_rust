@@ -871,3 +871,121 @@ export default function init(pi: any): void {
 
     write_jsonl_artifacts(&harness);
 }
+
+// ─── Load failure policy ─────────────────────────────────────────────────────
+
+/// Shared setup for the skip-vs-fail-closed pair: one extension that loads and
+/// one whose entry file cannot be evaluated (an unresolvable import), loaded
+/// together under the given policy.
+fn load_good_and_broken(
+    harness: &common::TestHarness,
+    policy: pi::extensions::ExtensionPolicy,
+) -> (ExtensionManager, Result<(), pi::error::Error>) {
+    let cwd = harness.temp_dir().to_path_buf();
+    let good_path = harness.create_file(
+        "extensions/good.ts",
+        br#"
+export default function init(pi: any): void {
+  pi.registerCommand("from-good", {
+    description: "Command from the extension that loads",
+    handler: async (): Promise<any> => ({})
+  });
+}
+"#,
+    );
+    let broken_path = harness.create_file(
+        "extensions/broken.ts",
+        br#"
+import { nothing } from "@does-not-exist/anywhere";
+export default function init(pi: any): void {
+  pi.registerCommand("from-broken", { description: String(nothing), handler: async () => ({}) });
+}
+"#,
+    );
+    harness.record_artifact("extensions/good.ts", &good_path);
+    harness.record_artifact("extensions/broken.ts", &broken_path);
+
+    let spec_good = JsExtensionLoadSpec::from_entry_path(&good_path).expect("spec good");
+    let spec_broken = JsExtensionLoadSpec::from_entry_path(&broken_path).expect("spec broken");
+
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let js_config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        ..Default::default()
+    };
+
+    let runtime = common::run_async({
+        let manager = manager.clone();
+        let tools = Arc::clone(&tools);
+        async move {
+            JsExtensionRuntimeHandle::start_with_policy(js_config, tools, manager, policy)
+                .await
+                .expect("start js runtime")
+        }
+    });
+    manager.set_js_runtime(runtime);
+
+    let result = common::run_async({
+        let manager = manager.clone();
+        async move { manager.load_js_extensions(vec![spec_good, spec_broken]).await }
+    });
+
+    (manager, result)
+}
+
+/// Default policy: the broken extension is skipped and named, the good one is
+/// live. This is the TS-pi behaviour; before it one bad package in
+/// `settings.json` left the interactive surface with no session at all.
+#[test]
+fn ts_broken_extension_is_skipped_and_reported_by_default() {
+    let harness =
+        common::TestHarness::new("ts_broken_extension_is_skipped_and_reported_by_default");
+
+    let (manager, result) = load_good_and_broken(&harness, pi::extensions::ExtensionPolicy::default());
+    result.expect("one broken extension must not fail the load");
+
+    assert!(manager.has_command("from-good"), "the working extension is live");
+    assert!(
+        !manager.has_command("from-broken"),
+        "nothing from the broken extension may register"
+    );
+
+    let failures = manager.load_failures();
+    assert_eq!(failures.len(), 1, "exactly the broken extension is reported: {failures:?}");
+    assert!(
+        failures[0].entry_path.ends_with("broken.ts"),
+        "failure names the entry file: {:?}",
+        failures[0].entry_path
+    );
+    assert!(
+        !failures[0].message.is_empty(),
+        "failure carries the load error for the user"
+    );
+
+    write_jsonl_artifacts(&harness);
+}
+
+/// `fail_closed_load`: the historical strict mode, for hosts that would rather
+/// not start than run with a partial extension set.
+#[test]
+fn ts_broken_extension_fails_the_load_when_fail_closed() {
+    let harness = common::TestHarness::new("ts_broken_extension_fails_the_load_when_fail_closed");
+
+    let policy = pi::extensions::ExtensionPolicy {
+        fail_closed_load: true,
+        ..Default::default()
+    };
+    let (manager, result) = load_good_and_broken(&harness, policy);
+    assert!(result.is_err(), "fail-closed mode must surface the broken extension as an error");
+    assert!(
+        !manager.has_command("from-good"),
+        "a failed load installs nothing, not even the extensions that would have worked"
+    );
+    assert!(
+        manager.load_failures().is_empty(),
+        "fail-closed reports through the error, not the skip list"
+    );
+
+    write_jsonl_artifacts(&harness);
+}
