@@ -1,5 +1,67 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 6, 2026-10-01, iteration-budget handoff)
+
+Branch `fix/bedrock-tool-use-type-and-pijs-compat`, HEAD `5b49bcd48`. Not pushed. Nothing installed since build 7.
+Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs`.
+
+### Bugs 1, 2, 3 — ALL CLOSED IN CODE ✅
+- Bug 3 e2e: `ts_broken_extension_is_skipped_and_reported_by_default ... ok`,
+  `ts_broken_extension_fails_the_load_when_fail_closed ... ok` (16 min build, 0.68 s run).
+- Docs for `extensionPolicy.failClosedLoad` landed (`06bfa2e34`): `docs/extension-troubleshooting.md`,
+  `docs/security/operator-handbook.md`.
+- Only Bug 2's unit test remains unrun (bug 4, macOS `--lib`).
+
+### Release build + live verify — IN FLIGHT
+`cargo build --locked --release --bin pi` running since ~35 min (pid 38929, cold release cache after the serde_json
+feature change; log `~/.pi/agent-rust/tool-output-artifacts/jobs/job-706527dcc3bc4e829880c1802095df96.log`).
+**Next agent, step 1:** when it finishes: `cp target/release/pi ~/.local/bin/pi-rust.new && mv -f ~/.local/bin/pi-rust.new ~/.local/bin/pi-rust`
+then `python3 /tmp/rpi-extfail-probe.py` (also at nothing else; it launches `rpi` in a pty and greps for the skip line).
+A deliberately broken extension is ALREADY IN PLACE at `~/.pi/agent-rust/extensions/zz-broken-probe.ts` —
+**⚠ until the new binary is installed, build 7 (fail-closed) will refuse to start a session with it present.**
+Expected probe output: `skip_line_seen=<n>s` and a `> Extension zz-broken-probe failed to load and was skipped: …` line.
+Afterwards rename the probe file to `zz-broken-probe.ts.disabled` (renaming, not deleting) or ask the user to remove it.
+Also sanity-run `/tmp/rpi-quit2.py` (startup/shutdown timing) and `/tmp/rpi-probe4.py` (freeze detector).
+
+### Pretty work, step 1 — slot framework: ENGINE WRITTEN, NOT WIRED
+`src/interactive_ftui/slots.rs` (`5b49bcd48`) is complete with 6 unit tests but is **not yet declared** (`mod slots;`
+missing in `interactive_ftui.rs` so the tree still compiles as before). Wiring plan, all in `src/interactive_ftui.rs`:
+1. Add `mod slots;` next to `mod info_commands;` (~line 65). `cargo check` + run the slots unit tests
+   (`cargo test --lib interactive_ftui::slots` won't build on macOS → `cargo check --all-targets` at least; the tests are
+   pure and will run on the Linux lane).
+2. Model: field `slots: slots::SlotRegistry` next to `ext_status` (~2044 in struct, init in `new()` ~2340).
+3. `Regions` (~2211) gains `slots_below: Rect` and `sidebar: Rect`; `layout_regions` (~2316) takes `below_rows`/`side_cols`:
+   add `Constraint::Fixed(below_rows)` between status and completion; after the vertical split, carve `side_cols` off the
+   right of `body` into `sidebar`. In `render_frame` (~5635) compute
+   `fixed_rows = 1 + banner + 1 + completion + input_rows + 1`, `let sl = self.slots.layout(w, h, fixed_rows)`, pass
+   `sl.below_rows`/`sl.side_cols`, then after the status line: `self.slots.render_stack(&sl.below, regions.slots_below, frame)`,
+   `self.slots.render_stack(&sl.side, regions.sidebar, frame)`, and LAST (after footer):
+   `if let Some(f) = &sl.float { self.slots.render_float(f, Style::new().fg(self.palette.accent), frame) }`.
+4. `apply_extension_ui_effect` (~4541): add `"setWidget" | "set_widget"` → id from `widgetId|id|name` (default `"widget"`),
+   lines from `payload.lines: [str]` or `text` split on `\n` (sanitize each) → `self.slots.set(SlotSpec::extension(id), lines)`;
+   empty clears. Update the test at ~12025 that asserts the printed fallback ("setWidget should still surface somehow")
+   to assert the slot instead.
+5. `/col` in `route_slash_command_tail` (~3742): `if let Some(cmd) = slots::ColCommand::parse(clean)` → Next/Prev →
+   `step_focus(true/false)`; Placement → `set_placement`; Float(id) (empty id = focused) → `float()`, push Error on Err;
+   Select(id) → focus; List → push a System entry listing `ids()` + placement. Also `ctrl+alt+←/→` → prev/next if the
+   key path is cheap to find.
+6. Esc: in the key handler, before other Esc handling, `if self.slots.unfloat() { return; }`.
+7. `❯` prompt icon: in `render_frame`, when `self.input_active()`, draw `Paragraph` of `❯ ` in a 2-col rect at the left of
+   `regions.input` and render the TextArea into `regions.input` shifted right by 2. Colour by
+   `self.status_snapshot.thinking` (`off`→muted, `low`→accent, `medium`→accent bold, `high`/`xhigh`→warning), else accent.
+8. Native producers (first two): `todo_summary` stays in the status line; additionally register a `todos` slot
+   (`SlotSpec::native("todos", 100).ephemeral(true)`) when the todo tool publishes a multi-line list (find `todo_summary =`
+   ~3124 and the PiMsg that carries it). The colbar extension (`~/.pi/agent-rust/extensions/colbar.ts`) publishes via
+   `setWidget`, so step 4 alone gives it a surface.
+9. Tests: a `render_frame` smoke test in the existing `mod tests` that registers a slot and asserts `layout_regions` heights;
+   extend `tool_cards_show_exit_code_elapsed_grep_and_find_grouping`-style harness if one exists for frames.
+
+### Then (unchanged order)
+Floating overlay for ask cards/pickers on the same primitive → ttfx gate → shimmer "Working…" → cycling thinking
+words / "Thought for Ns" → native colbar panels (working set, modelbar/devbar/flowbar) → read gutter.
+
+---
+
 ## STATUS UPDATE (session 5, 2026-10-01, iteration-budget handoff)
 
 Branch `fix/bedrock-tool-use-type-and-pijs-compat`, HEAD `ac189af0d`. Not pushed. Nothing installed since build 7.
