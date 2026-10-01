@@ -1,5 +1,39 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 5, 2026-10-01, iteration-budget handoff)
+
+Branch `fix/bedrock-tool-use-type-and-pijs-compat`, HEAD `ac189af0d`. Not pushed. Nothing installed since build 7.
+Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs`.
+
+### Bug 1 — CLOSED ✅ (session 4)
+### Bug 2 — code type-checks ✅ (`cargo check --locked --bin pi` clean in 5m28s on the warm cache). Unit test
+`recover_from_provider_quarantine_reloads_disk_and_clears_gate` still unrun (bug 4: `--lib` tests don't build on macOS).
+### Bug 3 — CODE COMPLETE, TREE COMPILES ✅, e2e test run IN FLIGHT
+Everything from the session-4 "remaining" list is landed in `ac189af0d`. The two e2e tests were started:
+`cargo test --locked --test e2e_ts_extension_loading ts_broken_extension` (pid 65313, log
+`~/.pi/agent-rust/tool-output-artifacts/jobs/job-df23c1131bb0407fa8f5eadfa0e7849d.log`, output only at the end).
+**Next agent, step 1:** read that log / re-run the command.
+- If `ts_broken_extension_is_skipped_and_reported_by_default` fails because the broken import does NOT error at load
+  (the shim may lazily resolve bare specifiers), change `broken.ts` in `load_good_and_broken` to a hard syntax error
+  (e.g. `export default function init(pi: any) { pi.registerCommand(`  — unterminated) so evaluation fails for sure.
+- If the fail-closed test's `!manager.has_command("from-good")` fails, it means a prior partial install leaked; that
+  would be a real bug in `load_js_extensions` (payloads are only installed after `?`, so it shouldn't).
+**Step 2:** `cargo check --locked --all-targets --message-format short` to catch any other `ExtensionPolicy` /
+`ExtensionPolicyConfig` struct literals I missed in tests (grep already covered `secret_broker:` and
+`allow_dangerous:`; examples/ and benches/ were not checked).
+**Step 3:** release build + install (`cp target/release/pi ~/.local/bin/pi-rust.new && mv -f … pi-rust`), re-add one
+dropped package (e.g. `pi-btw`) to `~/.pi/agent-rust/settings.json` `packages`, launch `rpi`, confirm the session comes up
+and a `Extension <id> failed to load and was skipped: …` System line appears. Also repro bug 2 if cheap.
+**Step 4:** README/docs mention of `extension_policy.failClosedLoad` (one line next to `allowDangerous`).
+
+### Bug 4 — untouched (macOS `cargo test --lib` / `mkfifoat`; `console_input.rs` rustfmt).
+
+### Then the pretty work (unchanged order)
+Prompt-area slot framework (+ `❯` icon by thinking level) → floating overlay/sidebar → ttfx gate → shimmer →
+cycling thinking words → native colbar panels → read gutter. See "Pi-rust sugar — revised design" below.
+
+---
+
 ## STATUS UPDATE (session 4, 2026-10-01, iteration-budget handoff)
 
 Branch `fix/bedrock-tool-use-type-and-pijs-compat`, HEAD `bc8414fd6`. Not pushed. Nothing installed since build 7.
