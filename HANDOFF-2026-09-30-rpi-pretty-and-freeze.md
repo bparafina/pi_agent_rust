@@ -22,13 +22,16 @@ Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs`.
   `todo_tool_end_feeds_the_todos_slot_and_footer`. Pure/simulator-based; run on the Linux lane (bug 4 on macOS).
 
 ### Next agent, step 1 — confirm the tree compiles
-`cargo check --locked --bin pi` after all edits: **CLEAN (EXIT 0)**, verified this session.
-In flight (read the logs; each ends with `EXIT n`):
-- `cargo check --locked --all-targets` (test crates): `~/.pi/agent-rust/tool-output-artifacts/jobs/job-5e510482cc20431db4ac76e657a49968.log`
-- Release build in the worktree at `818a23560`: `~/.pi/agent-rust/tool-output-artifacts/jobs/job-d4383b0bc633432a84ebcdc73a374cff.log`,
-  binary → `/tmp/pi-release-wt/target/release/pi` (cold cache, ~40+ min, `nice -n 10`).
-If the all-targets check fails inside the new tests, likely nits: the `/col` test uses `sim.model_mut().input.set_text` +
-Enter like `catalog_routes_shift_enter_newline_and_ctrl_d_exit`; `transcript[before..]` needs `TranscriptEntry.text` (it exists).
+`cargo check --locked --bin pi` after all edits: **CLEAN (EXIT 0)**.
+`cargo check --locked --all-targets --keep-going`: the ONLY errors in the whole tree are the two pre-existing macOS
+`mkfifoat` ones (bug 4: `src/artifact_output.rs:424`, `src/browser/download.rs:481`), which stop rustc before the
+`lib test` target reports anything else — so the three new simulator tests are **not type-checked on this machine**.
+Every integration test / example / bench crate is clean. Static review of the tests against `slots.rs`: 160-wide →
+`side_cols = 44`; 80×30 with `fixed_rows = 4` → budget 12, 3 rows used; `/col` reaches `route_slash_command_tail`
+before extension dispatch. First Linux-lane / dsr run should confirm; likely-nothing-to-fix.
+In flight: release build in the worktree at `818a23560`:
+`~/.pi/agent-rust/tool-output-artifacts/jobs/job-d4383b0bc633432a84ebcdc73a374cff.log`, binary →
+`/tmp/pi-release-wt/target/release/pi` (cold cache, ~40+ min, `nice -n 10`, log ends with `EXIT n`).
 
 ### Step 2 — release build + live verify (carried from sessions 6/7)
 Once the worktree build above lands:
