@@ -2263,6 +2263,7 @@ impl PolicyProfile {
                 per_extension: HashMap::new(),
                 exec_mediation: ExecMediationPolicy::strict(),
                 secret_broker: SecretBrokerPolicy::default(),
+                fail_closed_load: false,
             },
             Self::Standard => ExtensionPolicy::default(),
             Self::Permissive => ExtensionPolicy {
@@ -2273,6 +2274,7 @@ impl PolicyProfile {
                 per_extension: HashMap::new(),
                 exec_mediation: ExecMediationPolicy::permissive(),
                 secret_broker: SecretBrokerPolicy::default(),
+                fail_closed_load: false,
             },
         }
     }
@@ -2345,6 +2347,31 @@ pub struct ExtensionPolicy {
     /// and prevents raw disclosure when policy forbids it.
     #[serde(default)]
     pub secret_broker: SecretBrokerPolicy,
+    /// Whether one extension failing to load aborts the whole load.
+    ///
+    /// Off by default: a broken extension (unresolvable import, syntax the
+    /// engine lacks, a missing shim export) is skipped and reported through
+    /// [`ExtensionLoadFailure`], and every other extension still comes up —
+    /// the behaviour TypeScript pi has always had. Before this flag one bad
+    /// package in `settings.json` left the interactive surface at
+    /// "pi · ready" with no status bar and dead prompts, because
+    /// `create_agent_session` is fail-closed and nothing told the user which
+    /// extension to remove. `true` restores the strict mode for hosts that
+    /// would rather not start than run with a partial extension set.
+    #[serde(default)]
+    pub fail_closed_load: bool,
+}
+
+/// One extension that did not load, kept so a surface can say which one and
+/// why instead of silently running without it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionLoadFailure {
+    /// Extension id as resolved from its entry path / manifest.
+    pub extension_id: String,
+    /// The entry file that was asked to load.
+    pub entry_path: PathBuf,
+    /// The load error, already rendered for people.
+    pub message: String,
 }
 
 impl Default for ExtensionPolicy {
@@ -2363,6 +2390,7 @@ impl Default for ExtensionPolicy {
             per_extension: HashMap::new(),
             exec_mediation: ExecMediationPolicy::default(),
             secret_broker: SecretBrokerPolicy::default(),
+            fail_closed_load: false,
         }
     }
 }
@@ -11102,7 +11130,7 @@ enum JsRuntimeCommand {
         specs: Vec<JsExtensionLoadSpec>,
         origin: Option<SessionActionOrigin>,
         deadline: Instant,
-        reply: oneshot::Sender<Result<Vec<JsExtensionSnapshot>>>,
+        reply: oneshot::Sender<Result<JsExtensionLoadReport>>,
     },
     GetRegisteredTools {
         deadline: Instant,
@@ -11246,6 +11274,18 @@ struct JsRuntimeShardSet {
     provider_stream_routes: HashMap<String, JsProviderStreamRoute>,
     next_provider_stream_id: u64,
     pump_cursor: usize,
+    /// Extensions that were asked for but never became a shard. Filled only
+    /// when [`ExtensionPolicy::fail_closed_load`] is off; under the strict
+    /// mode the first failure aborts the whole load instead.
+    load_failures: Vec<ExtensionLoadFailure>,
+}
+
+/// What a JS extension load hands back: the registry snapshot of every shard
+/// that came up, plus the extensions that did not.
+#[derive(Debug, Default)]
+struct JsExtensionLoadReport {
+    snapshots: Vec<JsExtensionSnapshot>,
+    failures: Vec<ExtensionLoadFailure>,
 }
 
 #[derive(Default)]
@@ -11864,17 +11904,22 @@ impl JsExtensionRuntimeHandle {
                                     }
                                     candidate.next_provider_stream_id = next_provider_stream_id;
                                     let snapshots = candidate.snapshots();
+                                    let failures = std::mem::take(&mut candidate.load_failures);
                                     let shard_count = candidate.shards.len();
                                     shard_set = candidate;
                                     tracing::info!(
                                         event = "extension_runtime.shards.reload",
                                         reload_mode = "cold_transactional",
                                         shard_count,
+                                        skipped = failures.len(),
                                         pool_fingerprint = %fingerprint_short,
                                         startup_latency_ms = duration_ms_u64(startup_started.elapsed()),
                                         "Installed isolated JS extension runtime shards"
                                     );
-                                    Ok(snapshots)
+                                    Ok(JsExtensionLoadReport {
+                                        snapshots,
+                                        failures,
+                                    })
                                 }
                             };
                             let _ = reply.send(&cx, result);
@@ -12658,7 +12703,7 @@ impl JsExtensionRuntimeHandle {
     async fn load_extensions_snapshots(
         &self,
         specs: Vec<JsExtensionLoadSpec>,
-    ) -> Result<Vec<JsExtensionSnapshot>> {
+    ) -> Result<JsExtensionLoadReport> {
         let timeout_ms = EXTENSION_LOAD_BUDGET_MS;
         let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
@@ -13710,41 +13755,78 @@ async fn build_js_runtime_shards(
 
     let mut candidate = JsRuntimeShardSet::default();
     for (shard_index, (extension_id, extension_specs)) in grouped_specs.into_iter().enumerate() {
-        let shard_config = js_runtime_shard_config(warm_pool, shard_count, shard_index)?;
+        // The first entry path names the extension in a failure report; the
+        // specs are borrowed, so this is taken before the fallible block.
+        let entry_path = extension_specs
+            .first()
+            .map(|(spec, _)| spec.entry_path.clone())
+            .unwrap_or_default();
+        let shard_result: Result<JsRuntimeShard> = async {
+            let shard_config = js_runtime_shard_config(warm_pool, shard_count, shard_index)?;
 
-        let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
-            crate::scheduler::WallClock,
-            shard_config,
-            Some(policy.clone()),
-            extension_id.clone(),
-        )
-        .await?;
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+                crate::scheduler::WallClock,
+                shard_config,
+                Some(policy.clone()),
+                extension_id.clone(),
+            )
+            .await?;
 
-        // Files under another extension's root must remain a protected
-        // boundary even when both extensions live below the workspace cwd.
-        // Register peer roots as metadata only; this intentionally grants no
-        // read/write capability to the current shard.
-        for (foreign_extension_id, roots) in &extension_roots_by_id {
-            if foreign_extension_id == &extension_id {
-                continue;
+            // Files under another extension's root must remain a protected
+            // boundary even when both extensions live below the workspace cwd.
+            // Register peer roots as metadata only; this intentionally grants no
+            // read/write capability to the current shard.
+            for (foreign_extension_id, roots) in &extension_roots_by_id {
+                if foreign_extension_id == &extension_id {
+                    continue;
+                }
+                for root in roots {
+                    runtime.register_foreign_extension_root_boundary(root, foreign_extension_id);
+                }
             }
-            for root in roots {
-                runtime.register_foreign_extension_root_boundary(root, foreign_extension_id);
+
+            for (spec, entry_paths) in &extension_specs {
+                load_one_extension(&runtime, host, spec, entry_paths, origin, root_deadline)
+                    .await?;
+            }
+
+            let snapshot = require_single_shard_snapshot(
+                snapshot_extensions(&runtime).await?,
+                &extension_id,
+            )?;
+            Ok(JsRuntimeShard {
+                extension_id: extension_id.clone(),
+                runtime,
+                snapshot,
+                pump_fault: None,
+            })
+        }
+        .await;
+
+        match shard_result {
+            Ok(shard) => candidate.shards.push(shard),
+            // A load that ran out of its overall budget is not one broken
+            // extension; the actor needs the deadline error intact so it can
+            // report the load as expired rather than half-skipped.
+            Err(err) if policy.fail_closed_load || root_deadline <= Instant::now() => {
+                return Err(err);
+            }
+            Err(err) => {
+                let message = err.to_string();
+                tracing::warn!(
+                    event = "ext.load.skipped",
+                    extension_id = %extension_id,
+                    entry_path = %entry_path.display(),
+                    error = %message,
+                    "Extension failed to load and was skipped; the session continues without it"
+                );
+                candidate.load_failures.push(ExtensionLoadFailure {
+                    extension_id,
+                    entry_path,
+                    message,
+                });
             }
         }
-
-        for (spec, entry_paths) in extension_specs {
-            load_one_extension(&runtime, host, spec, &entry_paths, origin, root_deadline).await?;
-        }
-
-        let snapshot =
-            require_single_shard_snapshot(snapshot_extensions(&runtime).await?, &extension_id)?;
-        candidate.shards.push(JsRuntimeShard {
-            extension_id,
-            runtime,
-            snapshot,
-            pump_fault: None,
-        });
     }
 
     candidate.rebuild_indexes()?;

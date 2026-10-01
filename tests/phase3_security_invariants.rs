@@ -974,6 +974,7 @@ fn invariant_snapshot_agrees_with_policy_complex_multi_extension() {
         max_memory_mb: 256,
         exec_mediation: ExecMediationPolicy::default(),
         secret_broker: SecretBrokerPolicy::default(),
+        fail_closed_load: false,
     };
 
     // Extension A: permissive with exec allowed
