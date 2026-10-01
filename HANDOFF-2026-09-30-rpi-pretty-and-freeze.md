@@ -1,5 +1,67 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 7, 2026-10-01, iteration-budget handoff)
+
+Branch `fix/bedrock-tool-use-type-and-pijs-compat`. Not pushed. Nothing installed since build 7.
+Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs`.
+
+### New bead
+`bd-s9oeu` (P1 feature): **Automatic session resumption** — run the iteration-budget handoff natively
+(final bounded turn writes a structured handoff Custom entry → successor session auto-created, linked, seeded
+with handoff + summary → FTUI continues in place). Full spec in the bead description. This file's manual
+"STATUS UPDATE" ritual is exactly what it replaces.
+
+### Release build for live-verify (step 1 of session 6) — RE-STARTED, isolated
+Session 6's release build never finished (no log, `target/release/pi` still Sep 30 19:37 = build 7). Re-run in a
+**detached git worktree** so source edits here can't race it: `/tmp/pi-release-wt` (HEAD `1d06067a5`), job log
+`~/.pi/agent-rust/tool-output-artifacts/jobs/job-410efc89e71f40b0bc1adcc51773cd08.log`, binary will land at
+`/tmp/pi-release-wt/target/release/pi`. **Next agent, step 1:** when it exists:
+`cp /tmp/pi-release-wt/target/release/pi ~/.local/bin/pi-rust.new && mv -f ~/.local/bin/pi-rust.new ~/.local/bin/pi-rust`
+then `python3 /tmp/rpi-extfail-probe.py` (broken probe extension `~/.pi/agent-rust/extensions/zz-broken-probe.ts`
+is still in place; rename to `.disabled` afterwards — don't delete). Then `/tmp/rpi-quit2.py`, `/tmp/rpi-probe4.py`.
+The worktree can be removed later with `git worktree remove /tmp/pi-release-wt` — ask the user first (Rule 1).
+
+### Slot framework wiring — PARTIAL, in `src/interactive_ftui.rs` (this commit)
+Done (plan steps 1, 2, 3, 4, 7 of session 6):
+- `mod slots;` declared; `slots: slots::SlotRegistry` field + init.
+- `Regions` gained `sidebar` and `slots_below`; `layout_regions(area, input_rows, banner_rows, completion_rows,
+  slot_rows, sidebar_cols)` — sidebar is carved off the right of `body` only (chrome rows keep full width).
+- `render_frame`: computes `fixed_rows`, calls `self.slots.layout(...)`, renders sidebar stack after the body,
+  below-stack after the status line, float LAST after the footer; `❯` prompt icon via `split_prompt_icon` +
+  `prompt_icon_style()` (off→muted dim, medium→accent bold, high/xhigh→warning bold, else accent).
+- `apply_extension_ui_effect`: `"setWidget" | "set_widget"` → `slots.set(SlotSpec::extension(id), lines)`;
+  id from `widgetId|widget_id|widgetKey|widget_key|id|name` (default `"widget"`), lines from `lines[]` or `text`.
+- Tests updated: `layout_reserves_the_completion_rows_above_the_editor` (new arity),
+  `an_effect_this_stack_cannot_carry_out_still_prints` → renamed `set_widget_lands_in_a_slot_instead_of_the_transcript`.
+- `cargo check --locked --bin pi` was started in the background (job
+  `~/.pi/agent-rust/tool-output-artifacts/jobs/job-2c4c608eab2948ea91b5eaa566d6348e.log`) — **not observed**.
+  **Next agent, step 2:** read that log; fix whatever it reports (likely candidates: `Rect::new` field math on
+  `u16`, `Line::raw` taking `String`, `sanitize` returning `Cow`).
+
+Remaining (steps 5, 6, 8, 9):
+5. `/col` in `route_slash_command_tail` right after the `/exit|/quit|/q` arm:
+   `if let Some(cmd) = slots::ColCommand::parse(clean) { self.run_col_command(cmd); return true; }` and write
+   `fn run_col_command(&mut self, cmd: slots::ColCommand)`: Next/Prev → `step_focus` + System line naming the
+   focused id; Placement(p) → `set_placement`; Float(id) (empty = `focused()`) → `float()` / push Error on Err;
+   Select(id) → set focus (needs a small `focus_id(&str) -> bool` on `SlotRegistry`); List → System entry with
+   `ids()` joined + `placement()`.
+6. Esc: in the key handler, add BEFORE the `Interrupt if self.active_ask.is_some()` arm (~4873):
+   `Some(AppAction::Interrupt) if self.slots.floating().is_some() => { self.slots.unfloat(); return Cmd::none(); }`.
+8. Native `todos` producer. Finding: `agent_event_to_pi_msgs` (~5835) **never emits `PiMsg::TodoSummary`**, so
+   the FTUI todo footer has been dead. Fix in `E::ToolExecutionEnd`: when `tool_name == "todo" && !is_error &&
+   result.details.schema == crate::todo::TODO_LIST_SCHEMA`, also push `PiMsg::TodoSummary { summary: details.summary }`
+   (mirror `src/interactive/agent.rs:556`). Then in the `PiMsg::ToolEnd` handler (~3115), when `name == "todo"` and
+   not error, `self.slots.set(SlotSpec::native("todos", 100).ephemeral(true), lines)` from `output` split on `\n`
+   (output is `list.render()`; `"(todo list is empty)"` → clear).
+9. Tests: `render_frame` smoke via `ProgramSimulator` with a registered slot at 160×50 asserting a non-zero sidebar,
+   and at 80×30 asserting `slots_below` rows; a `/col float k` + Esc test using `send_ui_effect("setWidget", …)`.
+
+### Then (unchanged order)
+Floating overlay for ask cards/pickers on the same primitive → ttfx gate → shimmer "Working…" → cycling thinking
+words / "Thought for Ns" → native colbar panels (working set, modelbar/devbar/flowbar) → read gutter.
+
+---
+
 ## STATUS UPDATE (session 6, 2026-10-01, iteration-budget handoff)
 
 Branch `fix/bedrock-tool-use-type-and-pijs-compat`, HEAD `5b49bcd48`. Not pushed. Nothing installed since build 7.

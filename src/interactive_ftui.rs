@@ -65,6 +65,7 @@ use std::collections::{HashMap, VecDeque};
 mod info_commands;
 mod plan_commands;
 pub mod session_pins;
+mod slots;
 mod workspace_commands;
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
@@ -2038,6 +2039,9 @@ pub struct PiFtuiModel {
     /// Shown on the idle status line, ahead of the todo summary; cleared by an
     /// empty status.
     ext_status: Option<String>,
+    /// Panels drawn around the editor (todos, extension widgets, …): the
+    /// slot engine decides sidebar / below / float per frame.
+    slots: slots::SlotRegistry,
     /// Ask-tool card currently collecting answers via the editor.
     active_ask: Option<ActiveAsk>,
     /// Extension UI prompt currently collecting a reply (bd-1eoh4); extras
@@ -2211,9 +2215,15 @@ struct BusyOp {
 struct Regions {
     header: Rect,
     body: Rect,
+    /// Right-hand slot column carved off `body` on wide terminals; zero
+    /// columns when the slot engine put nothing there.
+    sidebar: Rect,
     /// Pinned error banner row (present only while an error is undissmissed).
     banner: Rect,
     status: Rect,
+    /// Slot stack between the status line and the editor; zero rows when
+    /// every slot went to the sidebar (or there are none).
+    slots_below: Rect,
     /// Slash-command completion popup, directly above the editor (issue
     /// #208); zero rows while no suggestions are showing.
     completion: Rect,
@@ -2313,7 +2323,14 @@ fn picker_window(selected: usize, len: usize, visible: usize) -> std::ops::Range
     start..(start + visible).min(len)
 }
 
-fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16, completion_rows: u16) -> Regions {
+fn layout_regions(
+    area: Rect,
+    input_rows: u16,
+    banner_rows: u16,
+    completion_rows: u16,
+    slot_rows: u16,
+    sidebar_cols: u16,
+) -> Regions {
     use ftui::layout::{Constraint, Flex};
     let rects = Flex::vertical()
         .constraints([
@@ -2321,19 +2338,39 @@ fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16, completion_rows
             Constraint::Fill,                   // conversation body
             Constraint::Fixed(banner_rows),     // pinned error banner (0 = none)
             Constraint::Fixed(1),               // status line (tool/todo/messages)
+            Constraint::Fixed(slot_rows),       // slot stack below the status (0 = none)
             Constraint::Fixed(completion_rows), // completion popup (0 = closed)
             Constraint::Fixed(input_rows),      // input editor
             Constraint::Fixed(1),               // footer (usage)
         ])
         .split(area);
+    // The sidebar is carved off the right of the conversation body only; the
+    // chrome rows keep the full width so the status/powerline and the editor
+    // do not narrow when a panel appears.
+    let full_body = rects[1];
+    let side = sidebar_cols.min(full_body.width);
+    let body = Rect::new(
+        full_body.x,
+        full_body.y,
+        full_body.width - side,
+        full_body.height,
+    );
+    let sidebar = Rect::new(
+        full_body.x + full_body.width - side,
+        full_body.y,
+        side,
+        full_body.height,
+    );
     Regions {
         header: rects[0],
-        body: rects[1],
+        body,
+        sidebar,
         banner: rects[2],
         status: rects[3],
-        completion: rects[4],
-        input: rects[5],
-        footer: rects[6],
+        slots_below: rects[4],
+        completion: rects[5],
+        input: rects[6],
+        footer: rects[7],
     }
 }
 
@@ -2364,6 +2401,7 @@ impl PiFtuiModel {
             resume_cwd: None,
             keybindings: KeyBindings::default(),
             ext_status: None,
+            slots: slots::SlotRegistry::default(),
             active_ask: None,
             active_ext: None,
             ext_queue: VecDeque::new(),
@@ -4558,8 +4596,38 @@ impl PiFtuiModel {
                 }
                 true
             }
-            // `setWidget` has no surface on this stack yet, and anything else
-            // is unknown; both keep the printed fallback.
+            // `setWidget` lands in the slot engine: the widget id keys the
+            // slot, `lines` (or `text` split on newlines) is the content, and
+            // empty content removes it. The layout decides where it draws.
+            "setWidget" | "set_widget" => {
+                let id = text_field(&["widgetId", "widget_id", "widgetKey", "widget_key", "id", "name"])
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| String::from("widget"));
+                let lines: Vec<ftui::text::Line<'static>> = request
+                    .payload
+                    .get("lines")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or_else(
+                        || {
+                            text_field(&["text"]).map_or_else(Vec::new, |text| {
+                                text.lines().map(|line| line.to_string()).collect()
+                            })
+                        },
+                        |items| {
+                            items
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(|line| sanitize(line).into_owned())
+                                .collect()
+                        },
+                    )
+                    .into_iter()
+                    .map(ftui::text::Line::raw)
+                    .collect();
+                self.slots.set(slots::SlotSpec::extension(id), lines);
+                true
+            }
+            // Anything else is unknown and keeps the printed fallback.
             _ => false,
         }
     }
@@ -5634,11 +5702,20 @@ impl PiFtuiModel {
     #[allow(clippy::too_many_lines)]
     fn render_frame(&self, frame: &mut Frame) {
         let area = Rect::new(0, 0, frame.width(), frame.height());
+        let banner_rows = u16::from(self.error_banner.is_some());
+        let completion_rows = self.completion_rows();
+        let input_rows = self.input_rows();
+        // Rows the chrome takes regardless of slots: header, banner, status,
+        // completion, editor, footer. The slot engine fits around them.
+        let fixed_rows = 1 + banner_rows + 1 + completion_rows + input_rows + 1;
+        let slot_layout = self.slots.layout(area.width, area.height, fixed_rows);
         let regions = layout_regions(
             area,
-            self.input_rows(),
-            u16::from(self.error_banner.is_some()),
-            self.completion_rows(),
+            input_rows,
+            banner_rows,
+            completion_rows,
+            slot_layout.below_rows,
+            slot_layout.side_cols,
         );
 
         // Header: identity + agent state.
@@ -5677,6 +5754,12 @@ impl PiFtuiModel {
         // measures a screenful instead of the entire history each frame.
         let window = Text::from_lines(body_text.lines().iter().skip(offset).take(visible).cloned());
         Paragraph::new(window).render(regions.body, frame);
+
+        // Sidebar slots sit beside the transcript on wide terminals.
+        if regions.sidebar.width > 0 {
+            self.slots
+                .render_stack(&slot_layout.side, regions.sidebar, frame);
+        }
 
         // Pinned error banner (bd-cv653.9.2): sits between the conversation
         // and the status line until the next sent input dismisses it.
@@ -5753,15 +5836,32 @@ impl PiFtuiModel {
                 .render(regions.status, frame);
         }
 
+        // Slot stack below the status line (narrow terminals, or slots that
+        // refuse the sidebar).
+        if regions.slots_below.height > 0 {
+            self.slots
+                .render_stack(&slot_layout.below, regions.slots_below, frame);
+        }
+
         // Slash-command completion popup (issue #208), pinned to the editor.
         if regions.completion.height > 0 {
             self.render_completion(regions.completion, frame);
         }
 
         // Input editor while idle or answering an ask card; processing note
-        // while the agent works uninterruptibly.
+        // while the agent works uninterruptibly. The `❯` prompt icon is
+        // coloured by the thinking level so the one thing the eye lands on
+        // between turns also says how hard the next one will think.
         if self.input_active() {
-            self.input.render(regions.input, frame);
+            let (icon, editor) = split_prompt_icon(regions.input);
+            if icon.width > 0 {
+                Paragraph::new(Text::from_lines([ftui::text::Line::styled(
+                    String::from("❯"),
+                    self.prompt_icon_style(),
+                )]))
+                .render(icon, frame);
+            }
+            self.input.render(editor, frame);
         } else {
             Paragraph::new(Text::raw(
                 "… processing (esc to abort, ctrl+c twice to quit)",
@@ -5783,7 +5883,52 @@ impl PiFtuiModel {
             footer_style,
         )]))
         .render(regions.footer, frame);
+
+        // The floating slot is the top z-layer: drawn after everything else
+        // so it covers the transcript and the chrome alike.
+        if let Some(float) = &slot_layout.float {
+            self.slots.render_float(
+                float,
+                ftui::Style::new().fg(self.palette.accent),
+                frame,
+            );
+        }
     }
+
+    /// Style of the `❯` prompt icon: the thinking level, as a colour ramp.
+    fn prompt_icon_style(&self) -> ftui::Style {
+        let level = self
+            .status_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.thinking.as_ref())
+            .map(|thinking| thinking.to_ascii_lowercase());
+        match level.as_deref() {
+            Some("off") => ftui::Style::new().dim().fg(self.palette.muted),
+            Some("medium") => ftui::Style::new().bold().fg(self.palette.accent),
+            Some("high" | "xhigh") => ftui::Style::new().bold().fg(self.palette.warning),
+            _ => ftui::Style::new().fg(self.palette.accent),
+        }
+    }
+}
+
+/// Columns the `❯ ` prompt icon takes off the left of the editor row.
+const PROMPT_ICON_COLS: u16 = 2;
+
+/// Split the editor region into the icon cell(s) and the editor itself. On a
+/// region too narrow to afford the icon, the editor keeps every column.
+fn split_prompt_icon(input: Rect) -> (Rect, Rect) {
+    if input.width <= PROMPT_ICON_COLS * 2 {
+        return (Rect::new(input.x, input.y, 0, 0), input);
+    }
+    (
+        Rect::new(input.x, input.y, PROMPT_ICON_COLS, input.height),
+        Rect::new(
+            input.x + PROMPT_ICON_COLS,
+            input.y,
+            input.width - PROMPT_ICON_COLS,
+            input.height,
+        ),
+    )
 }
 
 // ── Launch path ─────────────────────────────────────────────────────────────
@@ -12021,9 +12166,7 @@ mod tests {
     }
 
     #[test]
-    fn an_effect_this_stack_cannot_carry_out_still_prints() {
-        // `setWidget` has no surface here, so the old printed fallback is
-        // still the honest outcome — better than swallowing it.
+    fn set_widget_lands_in_a_slot_instead_of_the_transcript() {
         let (_tx, model) = new_model();
         let mut sim = ProgramSimulator::new(model);
         sim.init();
@@ -12034,9 +12177,19 @@ mod tests {
             "setWidget",
             serde_json::json!({"widgetKey": "k", "lines": ["a"]}),
         );
-        let added = &sim.model().transcript[before..];
-        assert_eq!(added.len(), 1, "setWidget should still surface somehow");
-        assert_eq!(added[0].role, EntryRole::System);
+        assert_eq!(
+            sim.model().transcript.len(),
+            before,
+            "setWidget must not print a fallback line"
+        );
+        assert_eq!(sim.model().slots.ids().collect::<Vec<_>>(), vec!["k"]);
+
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": "k", "lines": []}),
+        );
+        assert!(sim.model().slots.is_empty(), "empty content clears the slot");
     }
 
     #[test]
@@ -14991,14 +15144,14 @@ mod tests {
     #[test]
     fn layout_reserves_the_completion_rows_above_the_editor() {
         let area = Rect::new(0, 0, 80, 20);
-        let regions = layout_regions(area, 1, 0, 4);
+        let regions = layout_regions(area, 1, 0, 4, 0, 0);
         assert_eq!(regions.completion.height, 4);
         assert_eq!(
             regions.completion.y + regions.completion.height,
             regions.input.y
         );
         assert_eq!(regions.status.y + 1, regions.completion.y);
-        let closed = layout_regions(area, 1, 0, 0);
+        let closed = layout_regions(area, 1, 0, 0, 0, 0);
         assert_eq!(closed.completion.height, 0);
         assert_eq!(closed.body.height, regions.body.height + 4);
     }
