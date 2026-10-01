@@ -1,5 +1,52 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 9, 2026-10-01, iteration-budget handoff)
+
+Branch `fix/bedrock-tool-use-type-and-pijs-compat`. Not pushed. **Build 8 IS INSTALLED**
+(`/tmp/pi-release-wt/target/release/pi` == `~/.local/bin/pi-rust`, byte-identical, worktree job `EXIT 0`).
+Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs`. No source edits this session.
+
+### Probe run — FAILED, root cause identified (Bug 3 is only half-closed)
+`python3 /tmp/rpi-extfail-probe.py` ×2: `ready=23.1s/9.6s skip_line_seen=None exited=28.8s/14.5s`. Session starts
+fine (fail-open works), but the **"Extension zz-broken-probe failed to load and was skipped" line never renders.**
+- Runtime side is CORRECT: `tui.log` 21:21:01Z `WARN … event="ext.load.skipped" extension_id=zz-broken-probe
+  … error=Extension error: Error resolving modul…`, then `extension_runtime.shards.reload … shard_count=23 skipped=1`.
+  (Not the Pattern-4 npm auto-stub: that needs `RepairMode::AutoStrict`; live default resolves to `suggest`.)
+  Not a batch-overwrite either: `load_js_extensions` is called exactly once per startup (`src/agent.rs:15301`).
+- TUI side is the bug — **ordering in the driver**, `src/interactive_ftui.rs:8961-8970`:
+  `create_driver_session` → `report_extension_load_failures` sends `PiMsg::System(...)` (line 8754/8779), THEN
+  `send_conversation_reset(&handle, &agent_tx, "pi interactive stack")` (line 8970) sends `PiMsg::ConversationReset`,
+  whose handler `apply_conversation_reset` (line 5324) does `self.transcript.clear()` (line 5329). The skip line is
+  pushed to the transcript and wiped ~ms later. pi-voice's "[pi-voice] Extension Pi Voice installed" line survives
+  because it arrives later via `session_start` event dispatch.
+- Not yet checked: whether the unit test for this (Bug 2/3 FTUI test) uses a simulator path that never sends
+  `ConversationReset`, which is why it passed.
+
+### Next agent, step 1 — fix (small, one file)
+Pick one in `src/interactive_ftui.rs`:
+(a) move `report_extension_load_failures(&handle, agent_tx)` out of `create_driver_session` (line 8754) to the driver
+after `send_conversation_reset(...)` at line 8970 (simplest; keeps the line as a System transcript entry); or
+(b) keep the call where it is and have `apply_conversation_reset` preserve `EntryRole::System` entries that were
+pushed before the first reset (more invasive, touches a shared path). Prefer (a). Add a `ProgramSimulator` test:
+send `PiMsg::System("Extension x failed to load and was skipped: …")` then `PiMsg::ConversationReset{..}` in the
+driver's real order and assert the line is in the transcript (mirror the sims at 14107/14535/14796).
+Then rebuild in the worktree (`cd /tmp/pi-release-wt && git checkout <new sha> && cargo build --locked --release
+--bin pi`, ~40 min cold / faster warm), install, rerun `python3 /tmp/rpi-extfail-probe.py` →
+expect `skip_line_seen=<n>s` and a `> Extension zz-broken-probe failed to load and was skipped: …` line.
+
+### Step 2 — remaining live verify (unchanged)
+`~/.pi/agent-rust/extensions/zz-broken-probe.ts` is STILL IN PLACE (needed for the re-probe; rename to `.disabled`
+afterwards — do not delete). Then `/tmp/rpi-quit2.py`, `/tmp/rpi-probe4.py`; live-check `/col`, `/col float todos`,
+Esc, todo footer. Worktree removal needs the user's OK (Rule 1).
+Probe tip: with `RUST_LOG=...` set, startup logs still go to `~/.pi/agent-rust/logs/tui.log` (strip ANSI with
+`sed 's/\x1b\[[0-9;]*m//g'` before grepping); only shutdown-time logs land on the pty.
+
+### Then (unchanged order)
+Floating overlay for ask cards/pickers on the same primitive → ttfx gate → shimmer "Working…" → cycling thinking
+words / "Thought for Ns" → native colbar panels (working set, modelbar/devbar/flowbar) → read gutter.
+
+---
+
 ## STATUS UPDATE (session 8, 2026-10-01, iteration-budget handoff)
 
 Branch `fix/bedrock-tool-use-type-and-pijs-compat`. Not pushed. Nothing installed since build 7.
