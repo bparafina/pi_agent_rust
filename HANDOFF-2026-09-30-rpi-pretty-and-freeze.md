@@ -1,5 +1,56 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 4, 2026-10-01, iteration-budget handoff)
+
+Branch `fix/bedrock-tool-use-type-and-pijs-compat`, HEAD `bc8414fd6`. Not pushed. Nothing installed since build 7.
+Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs`.
+
+### Bug 1 — CLOSED ✅
+`cargo test --locked --test session_conformance assistant_entry_serialization_is_stable` → **ok** (34 min full rebuild,
+log `~/.pi/agent-rust/tool-output-artifacts/jobs/job-c17b87e835064990b262de8046bfc549.log`). The `float_roundtrip`
+serde_json feature in `030b6344c` is the fix. Debug build cache is now warm.
+
+### Bug 2 — committed `e24c0582f`, STILL NOT TYPE-CHECKED (see session 3 notes below)
+
+### Bug 3 — WIP `bc8414fd6`, **TREE DOES NOT COMPILE** until these are done
+Policy taken (ask timed out; went with the recommended option): skip-and-warn like TS pi, strict mode opt-in via
+`ExtensionPolicy.fail_closed_load` (default false). Done in `src/extensions.rs`: policy field (+ all struct literals, incl.
+`tests/phase3_security_invariants.rs`), `pub struct ExtensionLoadFailure {extension_id, entry_path, message}`,
+`JsRuntimeShardSet.load_failures`, private `JsExtensionLoadReport {snapshots, failures}`, `LoadExtensions.reply` and
+`load_extensions_snapshots` (~12690) return `Result<JsExtensionLoadReport>`, actor reply (~11900) fills it,
+`build_js_runtime_shards` (~13720) wraps the per-extension load in an `async {}` block and records+skips failures
+unless `policy.fail_closed_load || root_deadline <= Instant::now()`.
+
+**Remaining, in order (next agent, step 1):**
+1. `src/extensions/native_runtime.rs:672` `load_js_extensions_snapshots` → return `Result<JsExtensionLoadReport>`
+   (the `NativeRust` arm stays an error). `JsExtensionLoadReport` is private to `extensions.rs`; make it `pub(crate)`
+   or `pub(super)` as needed.
+2. `src/extensions/extension_manager_impl.rs:3171`: `let report = runtime.load_js_extensions_snapshots(specs).await?;`
+   then iterate `report.snapshots`; add `load_failures: Vec<ExtensionLoadFailure>` to `ExtensionManagerInner`
+   (`src/extensions.rs:~20111`) and set `guard.load_failures = report.failures` in the same guard block (~3263).
+   Add `pub fn load_failures(&self) -> Vec<ExtensionLoadFailure>` on `ExtensionManager` (mirror
+   `cached_policy_prompt_decision` style at extension_manager_impl.rs:2964).
+3. Config: `ExtensionPolicyConfig.fail_closed_load: Option<bool>` (`#[serde(alias = "failClosedLoad")]`, src/config.rs:293),
+   merge at `merge_extension_policy` (config.rs:2254–2261), and in `resolve_extension_policy_with_metadata` after
+   `allow_dangerous` (~1400): `policy.fail_closed_load = self.extension_policy.as_ref().and_then(|p| p.fail_closed_load).unwrap_or(false);`.
+4. FTUI surfacing: `src/interactive_ftui.rs:8493` is the initial `create_agent_session(...).await`; on `Ok(handle)` call
+   `handle.extension_manager()` (sdk.rs:2026) → `.load_failures()`; if non-empty send one `PiMsg::System` per failure:
+   `"Extension <id> failed to load and was skipped: <message> (<entry_path>)"`. Do the same for `/new` and `/resume`
+   replacement paths if cheap.
+5. `cargo check --locked --bin pi` (bug 2 code gets checked at the same time), fix, then `cargo test --locked --lib
+   extensions` won't build on macOS (bug 4) — rely on `cargo check --all-targets` for the test crates.
+6. Add a test: an extension dir with one good and one syntactically broken `.ts`; `load_js_extensions` returns Ok, manager
+   lists the good one, `load_failures()` has the broken one; with `fail_closed_load = true` it errors. Look for an
+   existing JS load test to copy the harness (grep `load_js_extensions(` in src/extensions/*test*.rs).
+7. Rebuild release, install via `cp target/release/pi ~/.local/bin/pi-rust.new && mv -f …`, then re-add one of the
+   dropped packages from the rpi profile (e.g. `pi-btw`) to confirm the session comes up and the System line appears.
+
+### Then the pretty work (unchanged order)
+Prompt-area slot framework (+ `❯` icon by thinking level) → floating overlay/sidebar → ttfx gate → shimmer →
+cycling thinking words → native colbar panels → read gutter. See "Pi-rust sugar — revised design" below.
+
+---
+
 ## STATUS UPDATE (session 3, 2026-10-01, iteration-budget handoff)
 
 Branch `fix/bedrock-tool-use-type-and-pijs-compat`, HEAD `e24c0582f` (on top of `030b6344c`). Not pushed.
