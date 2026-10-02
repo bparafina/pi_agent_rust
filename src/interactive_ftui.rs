@@ -1533,10 +1533,11 @@ fn format_elapsed(elapsed: Duration) -> String {
         format!("{}m{:02}s", secs / 60, secs % 60)
     }
 }
-/// An ask-tool card being answered (bd-cv653.3.8), mirroring the inline flow
-/// of the bubbletea stack: the card renders into the transcript and the
-/// editor collects the reply (`1`/label to select, comma-separated for multi,
-/// free text for Other, `cancel` to dismiss).
+/// An ask-tool card being answered (bd-cv653.3.8). The card lives in the
+/// floating window ([`slots::FloatWindow`]) while it is active and the
+/// editor collects the reply (`1`/label to select, comma-separated for
+/// multi, free text for Other, `cancel` to dismiss); once a question
+/// settles, a compact `question → answer` record goes into the transcript.
 struct ActiveAsk {
     request: AskUiRequest,
     question_index: usize,
@@ -1552,11 +1553,11 @@ pub struct AskUiReply {
     pub response: AskResponse,
 }
 
-/// Modal list picker rendered over the conversation body. All pickers of the
-/// bubbletea stack (theme, model, session, branch) share this shape; while
-/// open it captures every key (Up/Down navigate, Enter confirms, Esc
-/// closes, typing filters; j/k navigate until a filter is typed), matching
-/// the modal-capture chain in `update_inner`.
+/// Modal list picker drawn in the floating window over the conversation. All
+/// pickers of the bubbletea stack (theme, model, session, branch) share this
+/// shape; while open it captures every key (Up/Down navigate, Enter confirms,
+/// Esc closes, typing filters; j/k navigate until a filter is typed),
+/// matching the modal-capture chain in `update_inner`.
 struct PickerOverlay {
     title: String,
     items: Vec<String>,
@@ -2048,6 +2049,9 @@ pub struct PiFtuiModel {
     /// queue behind it, mirroring the bubbletea active/queue pair.
     active_ext: Option<ExtensionUiRequest>,
     ext_queue: VecDeque<ExtensionUiRequest>,
+    /// The last reply the active card (ask or extension) rejected, shown in
+    /// the card's window until the next reply; cleared when the card settles.
+    card_error: Option<String>,
     /// User draft captured when the first response-bearing card takes over the
     /// editor. Successor cards share the snapshot; the last terminal path
     /// restores it only after clearing card-owned input.
@@ -2405,6 +2409,7 @@ impl PiFtuiModel {
             active_ask: None,
             active_ext: None,
             ext_queue: VecDeque::new(),
+            card_error: None,
             card_draft_snapshot: None,
             ext_reply_tx: None,
             ask_reply_tx: None,
@@ -3273,7 +3278,8 @@ impl PiFtuiModel {
                 } else {
                     self.autocomplete.close();
                     self.capture_preexisting_card_draft();
-                    self.push_ask_card(&request, 0);
+                    self.card_error = None;
+                    self.scroll_from_tail = 0;
                     self.active_ask = Some(ActiveAsk {
                         request,
                         question_index: 0,
@@ -3380,14 +3386,13 @@ impl PiFtuiModel {
         Cmd::none()
     }
 
-    /// Render one ask question card into the transcript (sanitized — the
-    /// question text originates from the model/tool side).
-    fn push_ask_card(&mut self, request: &AskUiRequest, index: usize) {
-        let total = request.request.questions.len();
-        let card =
-            crate::ask::format_question_card(&request.request.questions[index], index, total);
-        let text = sanitize(card.trim_end()).into_owned();
-        self.push_entry(EntryRole::Ask, text);
+    /// Leave the durable trace of a settled card in the transcript: the
+    /// question (or prompt heading) and what happened to it. The card itself
+    /// lived in the floating window and is gone once it settles.
+    fn record_card(&mut self, heading: &str, outcome: &str) {
+        let heading = sanitize(heading.trim()).into_owned();
+        let outcome = sanitize(outcome.trim()).into_owned();
+        self.push_entry(EntryRole::Ask, format!("{heading}\n  → {outcome}"));
         self.scroll_from_tail = 0;
     }
 
@@ -3411,14 +3416,14 @@ impl PiFtuiModel {
         let question = &ask.request.request.questions[index];
         match crate::ask::parse_question_reply(question, &raw) {
             Err(err) => {
-                let text = format!("  ! {}", sanitize(&err));
-                self.push_entry(EntryRole::Ask, text);
-                self.scroll_from_tail = 0;
+                // The window shows the rejection next to the question; the
+                // transcript hears nothing until the question settles.
+                self.card_error = Some(sanitize(&err).into_owned());
                 self.active_ask = Some(ask); // same question again
             }
             Ok(QuestionReply::Cancel) => {
-                self.push_entry(EntryRole::Ask, String::from("  (dismissed)"));
-                self.scroll_from_tail = 0;
+                self.card_error = None;
+                self.record_card(&question.question, "(dismissed)");
                 self.send_ask_reply(ask.request.id, Vec::new(), true);
                 self.maybe_activate_queued_ext();
             }
@@ -3428,12 +3433,11 @@ impl PiFtuiModel {
                     QuestionReply::Other(text) => (Vec::new(), Some(text)),
                     QuestionReply::Cancel => unreachable!("handled above"),
                 };
-                let echo = other.as_ref().map_or_else(
-                    || format!("  → {}", selected.join(", ")),
-                    |text| format!("  → {text}"),
-                );
-                let echo = sanitize(&echo).into_owned();
-                self.push_entry(EntryRole::Ask, echo);
+                let outcome = other
+                    .clone()
+                    .unwrap_or_else(|| selected.join(", "));
+                self.card_error = None;
+                self.record_card(&question.question, &outcome);
                 let question_id = question.id.clone().unwrap_or_else(|| index.to_string());
                 ask.answers.push(AskAnswer {
                     question_id,
@@ -3442,11 +3446,9 @@ impl PiFtuiModel {
                 });
                 let next = index + 1;
                 if next < ask.request.request.questions.len() {
-                    self.push_ask_card(&ask.request, next);
                     ask.question_index = next;
                     self.active_ask = Some(ask);
                 } else {
-                    self.scroll_from_tail = 0;
                     self.send_ask_reply(ask.request.id, ask.answers, false);
                     self.maybe_activate_queued_ext();
                 }
@@ -5037,8 +5039,11 @@ impl PiFtuiModel {
                     Some(AppAction::Interrupt) if self.active_ask.is_some() => {
                         // Escape dismisses the pending ask card.
                         if let Some(ask) = self.active_ask.take() {
-                            self.push_entry(EntryRole::Ask, String::from("  (dismissed)"));
-                            self.scroll_from_tail = 0;
+                            let question = ask.request.request.questions[ask.question_index]
+                                .question
+                                .clone();
+                            self.card_error = None;
+                            self.record_card(&question, "(dismissed)");
                             self.send_ask_reply(ask.request.id, Vec::new(), true);
                             self.input.set_text("");
                             self.maybe_activate_queued_ext();
@@ -5982,9 +5987,11 @@ impl PiFtuiModel {
 
         // The floating slot is the top z-layer: drawn after everything else
         // so it covers the transcript and the chrome alike.
-        if let Some(float) = &slot_layout.float {
-            self.slots.render_float(
-                float,
+        if let Some(float) = &slot_layout.float
+            && let Some(window) = self.slots.float_window(float)
+        {
+            window.render(
+                float.rect,
                 ftui::Style::new().fg(self.palette.accent),
                 frame,
             );

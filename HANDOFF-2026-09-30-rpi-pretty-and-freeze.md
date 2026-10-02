@@ -1,5 +1,64 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 10, 2026-10-01, iteration-budget handoff)
+
+Branch `fix/bedrock-tool-use-type-and-pijs-compat`. Not pushed. Build 9 still installed (nothing rebuilt this session).
+Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs` (now a 9-line rustfmt-only diff).
+
+### Floating overlay for ask cards / pickers — PRIMITIVE LANDED, WIRING HALF DONE (this commit)
+**Type-check NOT observed.** `cargo check --locked --bin pi` was started in the background at the end of the budget:
+`~/.pi/agent-rust/tool-output-artifacts/jobs/job-a634dd5ab13c47ef8194d9b68e602fc4.log` (ends with `EXIT n`).
+**Next agent, step 1:** read that log and fix what it reports before anything else.
+
+Done:
+- `src/interactive_ftui/slots.rs`: new `pub(crate) struct FloatWindow { title, lines, footer: Option<Line>, wanted_cols: Option<u16> }`
+  with `new/footer/wanted_cols/rect(w,h)/content_rows(w,h)/render(rect, border, frame)`; free fn
+  `float_window_rect(width, height, content_rows, wanted_cols)` (`FLOAT_MAX_PERCENT = 70`; `wanted_cols` widens the
+  60% band up to `width-2`). `SlotRegistry::float_rect` now calls it; `render_float` was REPLACED by
+  `float_window(&PlacedSlot) -> Option<FloatWindow>`. Test `float_window_widens_for_long_content_and_reserves_the_footer_row`.
+- `src/interactive_ftui.rs`: `render_frame` renders the floating slot via `self.slots.float_window(float)` + `window.render(..)`.
+  Model field `card_error: Option<String>` (+ init). Ask card no longer goes into the transcript: `push_ask_card` deleted;
+  activation sets `card_error = None`; `submit_ask_answer` stores parse errors in `card_error`, and on settle calls new
+  `record_card(heading, outcome)` → one `EntryRole::Ask` entry `"{question}\n  → {answer|(dismissed)}"`. Esc path does the same.
+  Doc comments on `ActiveAsk`/`PickerOverlay` updated.
+
+**Remaining (in order) — the tree is in an intermediate state: the ask card is currently NOT RENDERED ANYWHERE
+(removed from the transcript, not yet drawn in the window). Do not install a build until step 3 is done.**
+1. Fix the type-check (likely: borrow of `question` vs `ask` in `submit_ask_answer` — `question` is `&ask.request…`;
+   if rustc complains, clone `question.question` and `question.id` up front; unused-method warnings on
+   `FloatWindow::footer/wanted_cols/content_rows` until the picker uses them).
+2. `fn float_content(&self) -> Option<slots::FloatWindow>` on the model, precedence picker > ask card > ext card > floating slot:
+   - ask: `crate::ask::format_question_card(q, index, total)` → `sanitize` → split `'\n'`; line 0 dim, line 1 bold, last line
+     (the hint) as `footer` dim; append `card_error` in `palette.error`; title = `q.header.unwrap_or("ask")`.
+   - ext: `format_extension_ui_prompt(&request)` the same way (line 0 is `[prov] method: title`); title = `request.method`.
+   - picker: title line (`picker.title` + the `(sel/total)` / `filter:` status exactly as `render_picker` builds it now) as
+     line 0, then the windowed items with `▸ ` marker; `footer = PICKER_HINT` dim; `wanted_cols = longest item + 2`.
+     Visible rows = `float_window_rect(term.0, term.1, shown + 1 [+1 if "no matches"], cols).height - 2 - 1(footer) - 1(title)`;
+     use the same number for the page size in `handle_picker_action` (replaces `self.body_height() - 1` at ~4444) — add
+     `fn picker_visible_rows(&self) -> usize`.
+3. `render_frame`: delete the early `if let Some(picker) … render_picker … return;` (~5827) so the transcript stays under
+   the window; delete `render_picker`; at the end replace the slot-float block with
+   `if let Some(window) = self.float_content(&slot_layout) { window.render(window.rect(area.width, area.height), accent, frame) }`.
+   The `PiMsg::ToolEnd`/ext paths: `activate_ext_request` must stop pushing the card (`push_entry(EntryRole::Ask, …)` ~5372)
+   and set `card_error = None`; `submit_ext_answer` Err arm → `card_error`, Ok arm → `record_card(first line of the card, raw|"(cancelled)")`;
+   `cancel_active_ext` → `record_card(…, "(cancelled)")`. Esc on the floating slot (`5032`) must NOT fire while a picker/card
+   owns the window (order the arms: picker handled earlier already; put the `slots.floating()` arm after the ask/ext arms).
+4. Tests (can only run on the Linux lane — bug 4): existing `ask_card_collects_answers_across_questions` asserts
+   `rendered.contains("Pick a color?")` at 50×12 → window is 40 cols × ≤8 rows, fits. `long_picker_scrolls_to_keep_the_selection_on_screen`
+   at 50×10 → 7-row window: title + 3 items + hint; its `!contains("model-30")` / `(31/40)` assertions still hold.
+   Grep the tests for `transcript` assertions on ask/ext card TEXT (e.g. `"  (dismissed)"`, `"  → "`) and update them to the
+   `record_card` shape. Add one sim test: ask arrives → frame shows the question inside `╭─ask─` border AND the transcript
+   has no card entry; after answering, transcript has `"Pick a color?\n  → blue"`.
+5. Release build in the worktree (`/tmp/pi-release-wt`, `git checkout <sha>`, `export PATH="$HOME/.cargo/bin:$PATH"`,
+   `cargo build --locked --release --bin pi`), install via `cp … pi-rust.new && mv -f`, then live: run the `ask` tool, `/model`,
+   `/resume`, `/col float todos` + Esc.
+
+### Then (unchanged order)
+ttfx gate → shimmer "Working…" → cycling thinking words / "Thought for Ns" → native colbar panels (working set,
+modelbar/devbar/flowbar) → read gutter. Step 2 of session 9 (hand live-check of `/col`, Esc, todo footer) is still open.
+
+---
+
 ## STATUS UPDATE (session 9, 2026-10-01, iteration-budget handoff)
 
 Branch `fix/bedrock-tool-use-type-and-pijs-compat`. Not pushed. **Build 8 IS INSTALLED**

@@ -19,9 +19,11 @@
 //!   [`BELOW_MAX_PERCENT`] of the screen height. Ephemeral slots are
 //!   fillers: they yield first when the budget is tight.
 //! * **Float** — one slot may be promoted to a bordered overlay drawn last
-//!   over the transcript (`/col float <id>`); Esc dismisses it. Ask cards
-//!   and the pickers will move onto the same primitive, so there is one
-//!   z-layer rather than three.
+//!   over the transcript (`/col float <id>`); Esc dismisses it. The window
+//!   itself is [`FloatWindow`], and ask cards, extension prompts and the
+//!   pickers draw on the same primitive, so there is one z-layer rather
+//!   than three. Exactly one window is on screen at a time; the model picks
+//!   which (see `PiFtuiModel::float_content`).
 //!
 //! The layout pass is a pure function of `(slots, width, height)` so it is
 //! cheap enough to run every frame and simple enough to test without a
@@ -45,6 +47,143 @@ const BELOW_MAX_PERCENT: u32 = 40;
 /// Floating window width bounds; the middle term is 60% of the width.
 const FLOAT_MIN_COLS: u16 = 40;
 const FLOAT_MAX_COLS: u16 = 100;
+/// Most of the screen height the floating window may take (percent).
+const FLOAT_MAX_PERCENT: u32 = 70;
+
+/// The one floating window: a bordered, titled box drawn last over the
+/// transcript, anchored bottom-right so it reads as attached to the prompt
+/// area. Slots, ask cards, extension prompts and pickers all describe
+/// themselves as one of these; [`FloatWindow::rect`] sizes it and
+/// [`FloatWindow::render`] draws it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FloatWindow {
+    /// Border title.
+    pub title: String,
+    /// Content, top-down. Beyond the window's rows the tail is cut, except
+    /// that `footer` is always drawn on the last row.
+    pub lines: Vec<Line<'static>>,
+    /// A line pinned to the bottom row of the window (key hints); takes one
+    /// row off the content.
+    pub footer: Option<Line<'static>>,
+    /// Inner columns the content would like. `None` takes the default 60%
+    /// band; `Some(n)` widens up to the screen (minus a margin) so long
+    /// picker rows are not cut at the default width.
+    pub wanted_cols: Option<u16>,
+}
+
+impl FloatWindow {
+    pub(crate) fn new(title: impl Into<String>, lines: Vec<Line<'static>>) -> Self {
+        Self {
+            title: title.into(),
+            lines,
+            footer: None,
+            wanted_cols: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn footer(mut self, footer: Line<'static>) -> Self {
+        self.footer = Some(footer);
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn wanted_cols(mut self, cols: u16) -> Self {
+        self.wanted_cols = Some(cols);
+        self
+    }
+
+    /// Content rows this window would like: lines plus the footer row.
+    fn wanted_rows(&self) -> u16 {
+        u16::try_from(self.lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(u16::from(self.footer.is_some()))
+    }
+
+    /// Where the window goes on a `width × height` screen. Pure, so the key
+    /// handlers (page size for a picker) and the renderer agree.
+    pub(crate) fn rect(&self, width: u16, height: u16) -> Rect {
+        float_window_rect(width, height, self.wanted_rows(), self.wanted_cols)
+    }
+
+    /// Inner rows left for `lines` once the border and footer are taken.
+    pub(crate) fn content_rows(&self, width: u16, height: u16) -> u16 {
+        self.rect(width, height)
+            .height
+            .saturating_sub(2)
+            .saturating_sub(u16::from(self.footer.is_some()))
+    }
+
+    /// Draw the window at `rect` with a `border` style: blank the area so
+    /// transcript text cannot bleed through short lines, then border,
+    /// content, footer.
+    pub(crate) fn render(&self, rect: Rect, border: Style, frame: &mut Frame) {
+        if rect.width < 3 || rect.height < 3 {
+            return;
+        }
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(border)
+            .title(self.title.as_str());
+        let inner = block.inner(rect);
+        let blank = std::iter::repeat_n(
+            Line::raw(" ".repeat(usize::from(rect.width))),
+            usize::from(rect.height),
+        );
+        Paragraph::new(Text::from_lines(blank)).render(rect, frame);
+        block.render(rect, frame);
+        let footer_rows = u16::from(self.footer.is_some()).min(inner.height);
+        let content = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(footer_rows),
+        );
+        if content.height > 0 {
+            let lines = self
+                .lines
+                .iter()
+                .take(usize::from(content.height))
+                .cloned();
+            Paragraph::new(Text::from_lines(lines)).render(content, frame);
+        }
+        if let Some(footer) = &self.footer
+            && footer_rows > 0
+        {
+            let footer_rect = Rect::new(inner.x, inner.y + content.height, inner.width, 1);
+            Paragraph::new(Text::from_lines([footer.clone()])).render(footer_rect, frame);
+        }
+    }
+}
+
+/// Geometry of the floating window for `content_rows` rows of content (the
+/// border is added here). `wanted_cols` widens the default 60% band.
+fn float_window_rect(width: u16, height: u16, content_rows: u16, wanted_cols: Option<u16>) -> Rect {
+    let default_cols = percent_of(width, 60)
+        .clamp(FLOAT_MIN_COLS.min(width), FLOAT_MAX_COLS)
+        .min(width);
+    let cols = match wanted_cols {
+        // Content plus the border, never flush with the screen edge, never
+        // narrower than the default band.
+        Some(wanted) => wanted
+            .saturating_add(2)
+            .clamp(default_cols, width.saturating_sub(2).max(default_cols)),
+        None => default_cols,
+    };
+    // Content plus the border, never more than FLOAT_MAX_PERCENT of the
+    // screen.
+    let max_rows = percent_of(height, FLOAT_MAX_PERCENT).max(3);
+    let rows = content_rows
+        .saturating_add(2)
+        .clamp(3, max_rows)
+        .min(height);
+    // Bottom-right of the transcript, one row above the chrome at the
+    // bottom so it reads as attached to the prompt area.
+    let x = width.saturating_sub(cols).saturating_sub(1);
+    let y = height.saturating_sub(rows).saturating_sub(4);
+    Rect::new(x, y, cols, rows)
+}
 
 /// How a slot wants to be placed. Everything a producer may say about layout;
 /// where the slot actually lands is the engine's call.
@@ -364,19 +503,9 @@ impl SlotRegistry {
         let id = self.floating.as_deref()?;
         let index = self.slots.iter().position(|slot| slot.spec.id == id)?;
         let slot = &self.slots[index];
-        let cols = percent_of(width, 60)
-            .clamp(FLOAT_MIN_COLS.min(width), FLOAT_MAX_COLS)
-            .min(width);
-        // Content plus the border, never more than 70% of the screen.
-        let max_rows = percent_of(height, 70).max(3);
-        let rows = (slot.wanted_rows() + 2).clamp(3, max_rows).min(height);
-        // Bottom-right of the transcript, one row above the chrome at the
-        // bottom so it reads as attached to the prompt area.
-        let x = width.saturating_sub(cols).saturating_sub(1);
-        let y = height.saturating_sub(rows).saturating_sub(4);
         Some(PlacedSlot {
             index,
-            rect: Rect::new(x, y, cols, rows),
+            rect: float_window_rect(width, height, slot.wanted_rows(), None),
         })
     }
 
@@ -402,28 +531,18 @@ impl SlotRegistry {
         }
     }
 
-    /// Draw the floating window: a rounded border titled with the slot id,
-    /// content inside.
-    pub(crate) fn render_float(&self, float: &PlacedSlot, border: Style, frame: &mut Frame) {
-        let Some(slot) = self.slots.get(float.index) else {
-            return;
-        };
-        let block = Block::new()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(border)
-            .title(slot.spec.id.as_str());
-        let inner = block.inner(float.rect);
-        // Clear what is under the window so transcript text cannot bleed
-        // through gaps in short lines.
-        let blank = std::iter::repeat_n(
-            Line::raw(" ".repeat(usize::from(float.rect.width))),
-            usize::from(float.rect.height),
-        );
-        Paragraph::new(Text::from_lines(blank)).render(float.rect, frame);
-        block.render(float.rect, frame);
-        let lines = slot.lines.iter().take(usize::from(inner.height)).cloned();
-        Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+    /// The floating slot as a window: a rounded border titled with the slot
+    /// id, content inside. `None` when nothing is floating.
+    pub(crate) fn float_window(&self, float: &PlacedSlot) -> Option<FloatWindow> {
+        let slot = self.slots.get(float.index)?;
+        Some(FloatWindow::new(
+            slot.spec.id.clone(),
+            slot.lines
+                .iter()
+                .take(usize::from(slot.spec.cap_rows))
+                .cloned()
+                .collect(),
+        ))
     }
 }
 
@@ -558,6 +677,32 @@ mod tests {
         let layout = registry.layout(80, 10, 5);
         assert!(layout.below.is_empty());
         assert_eq!(layout.below_rows, 0);
+    }
+
+    #[test]
+    fn float_window_widens_for_long_content_and_reserves_the_footer_row() {
+        // Default band: 60% of 120 is 72 columns.
+        let plain = FloatWindow::new("ask", lines(5));
+        assert_eq!(plain.rect(120, 40), Rect::new(47, 29, 72, 7));
+        assert_eq!(plain.content_rows(120, 40), 5);
+        // A wide picker asks for 90 inner columns: 92 with the border, still
+        // one column off each screen edge.
+        let wide = FloatWindow::new("model", lines(5))
+            .wanted_cols(90)
+            .footer(Line::raw("hints"));
+        let rect = wide.rect(120, 40);
+        assert_eq!(rect.width, 92);
+        assert_eq!(rect.height, 8, "5 lines + footer + border");
+        assert_eq!(wide.content_rows(120, 40), 5);
+        // Wider than the screen allows: pinned to width - 2.
+        let huge = FloatWindow::new("model", lines(5)).wanted_cols(500);
+        assert_eq!(huge.rect(120, 40).width, 118);
+        // Short screen: the window stops at 70% of the height and the
+        // footer still gets its row out of the content.
+        let tall = FloatWindow::new("ask", lines(40)).footer(Line::raw("hints"));
+        let rect = tall.rect(50, 10);
+        assert_eq!(rect.height, 7);
+        assert_eq!(tall.content_rows(50, 10), 4);
     }
 
     #[test]
