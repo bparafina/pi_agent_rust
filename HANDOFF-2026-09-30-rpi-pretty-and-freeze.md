@@ -1,5 +1,44 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 14, 2026-10-02, iteration-budget handoff)
+
+User asked for "sim tests for card lifecycle" = session-13 step 2 (bd-b6bja live background-work float card).
+
+### Done this session — committed `2c2c9de64`
+- **Step 1 (type-check) closed:** the `lib test` target builds on macOS with **no source fixes** to the session-13
+  model wiring; `cargo test --locked --lib live_work` → **8/8 green** (6 pure `live_work` unit tests + 2 sim tests).
+  Build took 30m10s at load ~45. The 4 warnings are pre-existing (`fetch_update` deprecations in lsp/extensions, linker
+  `__eh_frame` note) — not ours.
+- **Step 2 (sim tests) closed**, both in `src/interactive_ftui.rs` `mod tests` right after
+  `ask_card_floats_and_leaves_a_compact_record_when_it_settles`:
+  - `live_work_card_floats_keeps_ticking_and_settles_to_a_record` — float border, `background · 1`, row + dim tail,
+    `⟳ 1` chip, Tick→`CmdRecord::Tick` while idle, exit 0 → `EntryRole::Ask` `✓ job job-1 … · exit 0`, window+chip gone,
+    Tick→`CmdRecord::None`; failed subagent → `EntryRole::Error`.
+  - `live_work_card_clears_silently_on_session_switch_and_survives_same_session_reset` — same-session
+    `ConversationReset` keeps the card; a different `session_id` drops it with **no** `· gone` record even when a later
+    empty snapshot arrives.
+  - Items use `PiFtuiModel::unix_now_ms().saturating_sub(..)` for `started_ms` (a `0` start made the elapsed column a
+    12-digit minute count).
+- rustfmt applied to `live_work.rs` (whitespace only).
+
+### Host gotcha (cost ~1h of this session)
+Homebrew `cargo`/`rustc` (`/opt/homebrew/bin`) shadow the rustup proxies, so `rust-toolchain.toml` is ignored and the
+`-Z threads=4` rustflags fail with "only accepted on the nightly compiler". `rustup run` is NOT enough (cargo still
+finds Homebrew `rustc`). Use `export PATH="$HOME/.cargo/bin:$PATH"` before any cargo command.
+
+### Not done — next agent, in order
+1. **Not run:** UBS staged gate (`ubs --staged --only=rust .`) on `2c2c9de64` — queued user message pre-empted it. Run
+   `ubs --diff --only=rust .` or `python3 scripts/check_ubs_staged_delta.py` against that commit before the push.
+2. **Step 3 unchanged:** release build in `/tmp/pi-release-wt`, install (`cp … pi-rust.new && mv -f`), live-check
+   `bash {background:true, command:"sleep 20; echo hi"}`, `/tan`, a `subagent` delegation; confirm zero ticks when
+   idle with nothing live (`RUST_LOG=ftui_runtime=info`). Then `br close bd-b6bja --reason "…2c2c9de64"`,
+   `br sync --flush-only`.
+3. Branch `fix/bedrock-tool-use-type-and-pijs-compat` is now 25 commits ahead of origin, **not pushed**. Still
+   uncommitted and NOT mine: `src/providers/bedrock/streaming.rs`, `src/failover.rs`, `.beads/*` churn — leave them.
+4. Then (2) shimmer + thinking words, (3) colbar panels + read gutter — design unchanged below.
+
+---
+
 ## STATUS UPDATE (session 12b, 2026-10-02) — ROOT CAUSE FOUND, FIRST FIX LANDED (uncommitted until the test run lands)
 
 **The hard lock is a Bedrock body-stream stall amplified 4× by the retry policy — not the iteration cap, not
