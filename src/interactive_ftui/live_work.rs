@@ -169,7 +169,9 @@ impl LiveWork {
         self.live
             .iter()
             .map(|item| {
-                let elapsed = format_elapsed(Duration::from_millis(now_ms.saturating_sub(item.started_ms)));
+                let elapsed = format_elapsed(Duration::from_millis(
+                    now_ms.saturating_sub(item.started_ms),
+                ));
                 let head = format!(
                     "{spin} {} {} {elapsed:>6}  {}",
                     item.kind.label(),
@@ -190,7 +192,9 @@ impl LiveWork {
 
 fn settled_record(item: &WorkItem, now_ms: u64) -> SettledRecord {
     let outcome = item.outcome.as_ref();
-    let elapsed = format_elapsed(Duration::from_millis(now_ms.saturating_sub(item.started_ms)));
+    let elapsed = format_elapsed(Duration::from_millis(
+        now_ms.saturating_sub(item.started_ms),
+    ));
     let detail = outcome.map_or("gone", |outcome| outcome.detail.as_str());
     SettledRecord {
         ok: outcome.is_some_and(|outcome| outcome.ok),
@@ -360,8 +364,16 @@ mod tests {
     fn new_live_items_join_and_settled_ones_leave_with_a_record() {
         let mut work = LiveWork::default();
         let job = item("job:job-1", WorkKind::Job, "cargo test --lib", 1_000);
-        let agent = item("agent:scout-3", WorkKind::Subagent, "map the tick chain", 2_000);
-        assert!(work.apply(vec![job.clone(), agent.clone()], 3_000).is_empty());
+        let agent = item(
+            "agent:scout-3",
+            WorkKind::Subagent,
+            "map the tick chain",
+            2_000,
+        );
+        assert!(
+            work.apply(vec![job.clone(), agent.clone()], 3_000)
+                .is_empty()
+        );
         assert_eq!(work.count(), 2);
 
         let records = work.apply(
@@ -370,7 +382,10 @@ mod tests {
         );
         assert_eq!(records.len(), 1);
         assert!(records[0].ok);
-        assert_eq!(records[0].text, "job job-1 cargo test --lib · 1m00s · exit 0");
+        assert_eq!(
+            records[0].text,
+            "job job-1 cargo test --lib · 1m00s · exit 0"
+        );
         assert_eq!(work.count(), 1);
 
         // A vanished item is recorded as gone, not silently dropped.
@@ -422,8 +437,14 @@ mod tests {
         work.expect(now);
         assert!(work.is_active(now));
         assert!(!work.is_active(now + EXPECT_GRACE + Duration::from_millis(1)));
-        work.apply(vec![item("agent:tan-1", WorkKind::Tan, "look into x", 0)], 0);
-        assert!(work.expect_until.is_none(), "an item replaces the grace window");
+        work.apply(
+            vec![item("agent:tan-1", WorkKind::Tan, "look into x", 0)],
+            0,
+        );
+        assert!(
+            work.expect_until.is_none(),
+            "an item replaces the grace window"
+        );
         assert!(work.is_active(now + EXPECT_GRACE * 2));
         work.clear();
         assert!(!work.is_active(now));
@@ -466,6 +487,9 @@ mod tests {
 
         let mut timed_out = base;
         timed_out.status = String::from("timedOut");
-        assert_eq!(job_item(&timed_out).outcome.expect("settled").detail, "timed out");
+        assert_eq!(
+            job_item(&timed_out).outcome.expect("settled").detail,
+            "timed out"
+        );
     }
 }

@@ -12466,6 +12466,186 @@ mod tests {
         assert!(!rendered.contains("╭"), "window closed: {rendered:?}");
     }
 
+    /// bd-b6bja: a live background job floats as a display-only card with a
+    /// `⟳ N` status chip, keeps the tick chain alive while the agent is idle,
+    /// and settles into one compact transcript record.
+    #[test]
+    fn live_work_card_floats_keeps_ticking_and_settles_to_a_record() {
+        use ftui::runtime::simulator::CmdRecord;
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let job = live_work::WorkItem {
+            key: String::from("job:job-1"),
+            kind: live_work::WorkKind::Job,
+            id: String::from("job-1"),
+            label: String::from("cargo test --lib"),
+            started_ms: PiFtuiModel::unix_now_ms().saturating_sub(2_500),
+            tail: Some(String::from("test foo ... ok")),
+            outcome: None,
+        };
+        // Tracking is off in tests; feed the snapshot the registries would
+        // have produced.
+        sim.model_mut().absorb_live_work(vec![job.clone()]);
+        assert_eq!(sim.model().live_work.count(), 1);
+        let rendered = buffer_text(sim.capture_frame(80, 16), 80, 16);
+        assert!(rendered.contains("╭"), "no window border: {rendered:?}");
+        assert!(rendered.contains("background · 1"), "{rendered:?}");
+        assert!(rendered.contains("job job-1"), "{rendered:?}");
+        assert!(rendered.contains("cargo test --lib"), "{rendered:?}");
+        assert!(
+            rendered.contains("test foo ... ok"),
+            "tail row missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("⟳ 1"),
+            "status chip missing: {rendered:?}"
+        );
+        assert!(
+            sim.model().transcript.is_empty(),
+            "nothing recorded while the job runs"
+        );
+        // Idle agent, but the chain must keep flowing for the card.
+        sim.inject_event(Event::Tick);
+        assert!(
+            matches!(sim.command_log().last(), Some(CmdRecord::Tick(_))),
+            "tick chain parked with live work: {:?}",
+            sim.command_log().last()
+        );
+        // The job exits cleanly: row leaves, record arrives, window closes,
+        // chain parks.
+        let mut settled = job;
+        settled.outcome = Some(live_work::Outcome {
+            ok: true,
+            detail: String::from("exit 0"),
+        });
+        sim.model_mut().absorb_live_work(vec![settled]);
+        assert_eq!(sim.model().live_work.count(), 0);
+        let record = sim
+            .model()
+            .transcript
+            .iter()
+            .find(|entry| entry.role == EntryRole::Ask)
+            .expect("settled job recorded");
+        assert!(
+            record.text.starts_with("✓ job job-1 cargo test --lib · "),
+            "{}",
+            record.text
+        );
+        assert!(record.text.ends_with("· exit 0"), "{}", record.text);
+        let rendered = buffer_text(sim.capture_frame(80, 16), 80, 16);
+        assert!(!rendered.contains("╭"), "window still open: {rendered:?}");
+        assert!(!rendered.contains("⟳"), "chip still shown: {rendered:?}");
+        sim.inject_event(Event::Tick);
+        assert!(matches!(sim.command_log().last(), Some(CmdRecord::None)));
+        // A failed job records through the error role (its prefix is the ✗).
+        let mut failed = live_work::WorkItem {
+            key: String::from("agent:scout-2"),
+            kind: live_work::WorkKind::Subagent,
+            id: String::from("scout-2"),
+            label: String::from("map the tick chain"),
+            started_ms: PiFtuiModel::unix_now_ms().saturating_sub(1_200),
+            tail: None,
+            outcome: None,
+        };
+        sim.model_mut().absorb_live_work(vec![failed.clone()]);
+        failed.outcome = Some(live_work::Outcome {
+            ok: false,
+            detail: String::from("failed"),
+        });
+        sim.model_mut().absorb_live_work(vec![failed]);
+        let record = sim
+            .model()
+            .transcript
+            .iter()
+            .find(|entry| entry.role == EntryRole::Error)
+            .expect("failed delegation recorded");
+        assert!(
+            record
+                .text
+                .starts_with("subagent scout-2 map the tick chain · "),
+            "{}",
+            record.text
+        );
+        assert!(record.text.ends_with("· failed"), "{}", record.text);
+    }
+
+    /// bd-b6bja: the card belongs to the session that owns the work. A
+    /// reset that switches sessions drops the rows without recording them
+    /// (no `· gone` for work that merely stopped being ours); a reset of the
+    /// same session (rewind, compaction) keeps the card up.
+    #[test]
+    fn live_work_card_clears_silently_on_session_switch_and_survives_same_session_reset() {
+        use ftui::runtime::simulator::CmdRecord;
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: String::from("s1"),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        let job = live_work::WorkItem {
+            key: String::from("job:job-1"),
+            kind: live_work::WorkKind::Job,
+            id: String::from("job-1"),
+            label: String::from("sleep 20; echo hi"),
+            started_ms: PiFtuiModel::unix_now_ms().saturating_sub(3_000),
+            tail: None,
+            outcome: None,
+        };
+        sim.model_mut().absorb_live_work(vec![job.clone()]);
+        assert_eq!(sim.model().live_work.count(), 1);
+
+        // Same session: the card survives the transcript rebuild.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: String::from("s1"),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        assert_eq!(
+            sim.model().live_work.count(),
+            1,
+            "same-session reset dropped the card"
+        );
+        let rendered = buffer_text(sim.capture_frame(80, 16), 80, 16);
+        assert!(rendered.contains("background · 1"), "{rendered:?}");
+
+        // Switch sessions: the card is gone and nothing is recorded, now or
+        // when a later snapshot no longer lists the job.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: String::from("s2"),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        assert_eq!(
+            sim.model().live_work.count(),
+            0,
+            "session switch kept the card"
+        );
+        sim.model_mut().absorb_live_work(Vec::new());
+        assert!(
+            !sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text.contains("job-1")),
+            "another session's job was recorded here: {:?}",
+            sim.model()
+                .transcript
+                .iter()
+                .map(|e| &e.text)
+                .collect::<Vec<_>>()
+        );
+        let rendered = buffer_text(sim.capture_frame(80, 16), 80, 16);
+        assert!(!rendered.contains("╭"), "window still open: {rendered:?}");
+        assert!(!rendered.contains("⟳"), "chip still shown: {rendered:?}");
+        sim.inject_event(Event::Tick);
+        assert!(matches!(sim.command_log().last(), Some(CmdRecord::None)));
+    }
+
     #[test]
     fn catalog_routes_shift_enter_newline_and_ctrl_d_exit() {
         let (_tx, model) = new_model();
