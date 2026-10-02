@@ -159,7 +159,7 @@ impl FloatWindow {
 
 /// Geometry of the floating window for `content_rows` rows of content (the
 /// border is added here). `wanted_cols` widens the default 60% band.
-fn float_window_rect(width: u16, height: u16, content_rows: u16, wanted_cols: Option<u16>) -> Rect {
+pub(crate) fn float_window_rect(width: u16, height: u16, content_rows: u16, wanted_cols: Option<u16>) -> Rect {
     let default_cols = percent_of(width, 60)
         .clamp(FLOAT_MIN_COLS.min(width), FLOAT_MAX_COLS)
         .min(width);

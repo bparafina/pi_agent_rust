@@ -421,7 +421,7 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let target = resolve_new(root.path(), "result.bin", "test").unwrap();
-        rustix::fs::mkfifoat(rustix::fs::CWD, target.path(), Mode::RUSR | Mode::WUSR).unwrap();
+        make_fifo(target.path());
         let worker_target = target.clone();
         let (send, receive) = mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -453,5 +453,27 @@ mod tests {
                 .is_fifo()
         );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    /// Create a FIFO at `path`. rustix leaves `mkfifoat` out on Apple
+    /// platforms, so there the test shells out to `mkfifo(1)` instead of
+    /// not building at all (which hid every `--lib` test on macOS).
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    fn make_fifo(path: &std::path::Path) {
+        #[cfg(target_vendor = "apple")]
+        {
+            let status = std::process::Command::new("mkfifo")
+                .arg("-m")
+                .arg("600")
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "mkfifo {} failed: {status}", path.display());
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            use rustix::fs::Mode;
+            rustix::fs::mkfifoat(rustix::fs::CWD, path, Mode::RUSR | Mode::WUSR).unwrap();
+        }
     }
 }

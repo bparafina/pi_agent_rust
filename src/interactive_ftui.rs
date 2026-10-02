@@ -2327,6 +2327,59 @@ fn picker_window(selected: usize, len: usize, visible: usize) -> std::ops::Range
     start..(start + visible).min(len)
 }
 
+/// Border title of the picker's floating window.
+const fn picker_kind_label(kind: PickerKind) -> &'static str {
+    match kind {
+        PickerKind::Theme => "theme",
+        PickerKind::Model => "model",
+        PickerKind::Session => "sessions",
+        PickerKind::Rewind => "rewind",
+        PickerKind::ForkFrom => "fork",
+        PickerKind::Copy => "copy",
+    }
+}
+
+/// Inner columns a picker would like: its widest shown row (marker included)
+/// or its title, whichever is longer.
+fn picker_wanted_cols(picker: &PickerOverlay) -> u16 {
+    let widest = picker
+        .shown
+        .iter()
+        .filter_map(|&index| picker.items.get(index))
+        .map(|item| display_width(item) + 2)
+        .max()
+        .unwrap_or(0)
+        .max(display_width(&picker.title));
+    u16::try_from(widest).unwrap_or(u16::MAX)
+}
+
+/// Transcript heading for a settled extension prompt: the first line of the
+/// card (`[extension] method: title`).
+fn ext_card_heading(request: &ExtensionUiRequest) -> String {
+    format_extension_ui_prompt(request)
+        .lines()
+        .next()
+        .unwrap_or("extension prompt")
+        .to_string()
+}
+
+/// Rows of picker items the floating window shows on a `width × height`
+/// screen: the window minus its border, the title row and the hint footer.
+/// The renderer sizes from the frame and the key handler from the tracked
+/// terminal size — the same number in a live terminal — so PageDown moves
+/// exactly one screen of the list.
+fn picker_visible_rows(picker: &PickerOverlay, width: u16, height: u16) -> usize {
+    // Title row, every shown item (or the no-matches note), hint footer.
+    let wanted = 1 + picker.shown.len().max(1) + 1;
+    let rect = slots::float_window_rect(
+        width,
+        height,
+        u16::try_from(wanted).unwrap_or(u16::MAX),
+        Some(picker_wanted_cols(picker)),
+    );
+    usize::from(rect.height.saturating_sub(4))
+}
+
 fn layout_regions(
     area: Rect,
     input_rows: u16,
@@ -4443,7 +4496,12 @@ impl PiFtuiModel {
             }
             return;
         };
-        let page = self.body_height().saturating_sub(1).max(1);
+        // One screen of the list, as the window shows it.
+        let page = self
+            .picker
+            .as_ref()
+            .map_or(1, |picker| picker_visible_rows(picker, self.term.0, self.term.1))
+            .max(1);
         match action {
             AppAction::SelectUp => {
                 if let Some(picker) = self.picker.as_mut() {
@@ -5031,11 +5089,6 @@ impl PiFtuiModel {
                         return self.consume_scroll(|m| m.scroll_down(page));
                     }
                     Some(AppAction::Exit) if self.input.is_empty() => return Cmd::quit(),
-                    Some(AppAction::Interrupt) if self.slots.floating().is_some() => {
-                        // Escape closes the floating slot window first.
-                        self.slots.unfloat();
-                        return Cmd::none();
-                    }
                     Some(AppAction::Interrupt) if self.active_ask.is_some() => {
                         // Escape dismisses the pending ask card.
                         if let Some(ask) = self.active_ask.take() {
@@ -5053,6 +5106,12 @@ impl PiFtuiModel {
                     Some(AppAction::Interrupt) if self.active_ext.is_some() => {
                         // Escape cancels the pending extension prompt.
                         self.cancel_active_ext();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Interrupt) if self.slots.floating().is_some() => {
+                        // Escape closes a floated slot window. Cards come
+                        // first: while one is open it owns the window.
+                        self.slots.unfloat();
                         return Cmd::none();
                     }
                     Some(AppAction::Interrupt) if self.state == AgentUiState::Working => {
@@ -5367,14 +5426,13 @@ impl PiFtuiModel {
         self.scroll_from_tail = 0;
     }
 
-    /// Render an extension UI prompt into the transcript and make it the
-    /// active reply target.
+    /// Make an extension UI prompt the active reply target. The prompt is
+    /// drawn in the floating window (see `float_content`); the transcript
+    /// gets a record once it settles.
     fn activate_ext_request(&mut self, request: ExtensionUiRequest) {
         self.autocomplete.close();
         self.capture_preexisting_card_draft();
-        let card = format_extension_ui_prompt(&request);
-        let text = sanitize(card.trim_end()).into_owned();
-        self.push_entry(EntryRole::Ask, text);
+        self.card_error = None;
         self.scroll_from_tail = 0;
         self.active_ext = Some(request);
     }
@@ -5395,19 +5453,18 @@ impl PiFtuiModel {
         self.input.set_text("");
         match parse_extension_ui_response(&request, &raw) {
             Err(err) => {
-                let text = format!("  ! {}", sanitize(&err));
-                self.push_entry(EntryRole::Ask, text);
-                self.scroll_from_tail = 0;
+                self.card_error = Some(sanitize(&err).into_owned());
                 self.active_ext = Some(request);
             }
             Ok(response) => {
-                let echo = if response.cancelled {
-                    String::from("  (cancelled)")
+                let heading = ext_card_heading(&request);
+                let outcome = if response.cancelled {
+                    String::from("(cancelled)")
                 } else {
-                    format!("  → {}", sanitize(raw.trim()))
+                    raw.trim().to_string()
                 };
-                self.push_entry(EntryRole::Ask, echo);
-                self.scroll_from_tail = 0;
+                self.card_error = None;
+                self.record_card(&heading, &outcome);
                 self.send_ext_reply(response);
                 self.maybe_activate_queued_ext();
             }
@@ -5430,8 +5487,8 @@ impl PiFtuiModel {
     /// Cancel the active extension prompt (escape path).
     fn cancel_active_ext(&mut self) {
         if let Some(request) = self.active_ext.take() {
-            self.push_entry(EntryRole::Ask, String::from("  (cancelled)"));
-            self.scroll_from_tail = 0;
+            self.card_error = None;
+            self.record_card(&ext_card_heading(&request), "(cancelled)");
             self.send_ext_reply(ExtensionUiResponse {
                 id: request.id,
                 value: None,
@@ -5727,8 +5784,9 @@ impl PiFtuiModel {
         Paragraph::new(Text::from_lines(lines)).render(area, frame);
     }
 
-    /// Modal picker body + footer hint. Lines borrow the picker's strings —
-    /// no per-frame allocation.
+    /// The picker as a floating window on a `width × height` screen: title
+    /// row, the items that keep the selection on screen, key hints in the
+    /// footer.
     ///
     /// Only the window of items that keeps the selection on screen is
     /// rendered: the body used to draw every item from the top, so a `/model`
@@ -5737,10 +5795,9 @@ impl PiFtuiModel {
     /// position whenever the list is longer than the window, or, once a
     /// filter is typed, the filter and its match count (gh #244). Only the
     /// matching items are listed.
-    fn render_picker(&self, picker: &PickerOverlay, regions: &Regions, frame: &mut Frame) {
+    fn picker_float(&self, picker: &PickerOverlay, width: u16, height: u16) -> slots::FloatWindow {
         let title_style = ftui::Style::new().bold().fg(self.palette.accent);
-        // One row belongs to the title; the rest show items.
-        let visible = usize::from(regions.body.height).saturating_sub(1);
+        let visible = picker_visible_rows(picker, width, height);
         let shown = picker.shown.len();
         let window = picker_window(picker.selected, shown, visible);
         // Position when the list overflows the window; the filter and its
@@ -5757,11 +5814,11 @@ impl PiFtuiModel {
             String::new()
         };
         let title = if status.is_empty() {
-            ftui::text::Line::styled(picker.title.as_str(), title_style)
+            ftui::text::Line::styled(picker.title.clone(), title_style)
         } else {
             ftui::text::Line::from_spans([
-                ftui::text::Span::styled(picker.title.as_str(), title_style),
-                ftui::text::Span::styled(status.as_str(), title_style.dim()),
+                ftui::text::Span::styled(picker.title.clone(), title_style),
+                ftui::text::Span::styled(status, title_style.dim()),
             ])
         };
         let mut lines = vec![title];
@@ -5786,16 +5843,82 @@ impl PiFtuiModel {
             };
             lines.push(ftui::text::Line::from_spans([
                 ftui::text::Span::styled(marker, style),
-                ftui::text::Span::styled(item.as_str(), style),
+                ftui::text::Span::styled(item.clone(), style),
             ]));
         }
-        Paragraph::new(Text::from_lines(lines)).render(regions.body, frame);
         let footer_style = ftui::Style::new().dim().fg(self.palette.muted);
-        Paragraph::new(Text::from_lines([ftui::text::Line::styled(
-            PICKER_HINT,
-            footer_style,
-        )]))
-        .render(regions.footer, frame);
+        slots::FloatWindow::new(picker_kind_label(picker.kind), lines)
+            .footer(ftui::text::Line::styled(PICKER_HINT, footer_style))
+            .wanted_cols(picker_wanted_cols(picker))
+    }
+
+    /// An ask or extension card as a floating window. `card` is the
+    /// line-oriented text the classic stack prints: a heading line, the
+    /// question/message and options, and a last line of reply hints, which
+    /// becomes the footer. A rejected reply (`card_error`) is shown under the
+    /// options until the next attempt.
+    fn card_window(&self, title: &str, card: &str) -> slots::FloatWindow {
+        let text = sanitize(card.trim_end()).into_owned();
+        let mut raw: Vec<&str> = text.lines().collect();
+        let hint = if raw.len() > 1 { raw.pop() } else { None };
+        let heading_style = ftui::Style::new().dim().fg(self.palette.muted);
+        let question_style = ftui::Style::new().bold();
+        let mut lines: Vec<ftui::text::Line<'static>> = raw
+            .iter()
+            .enumerate()
+            .map(|(index, line)| match index {
+                0 => ftui::text::Line::styled(line.to_string(), heading_style),
+                1 => ftui::text::Line::styled(line.to_string(), question_style),
+                _ => ftui::text::Line::raw(line.to_string()),
+            })
+            .collect();
+        if let Some(error) = &self.card_error {
+            lines.push(ftui::text::Line::styled(
+                format!("  ! {error}"),
+                ftui::Style::new().fg(self.palette.error),
+            ));
+        }
+        let mut window = slots::FloatWindow::new(sanitize(title).into_owned(), lines);
+        if let Some(hint) = hint {
+            window = window.footer(ftui::text::Line::styled(
+                hint.to_string(),
+                ftui::Style::new().dim().fg(self.palette.muted),
+            ));
+        }
+        window
+    }
+
+    /// What the floating window shows this frame, if anything. One z-layer:
+    /// a picker owns it outright, then a card collecting a reply, then a
+    /// slot the user floated with `/col float`.
+    fn float_content(
+        &self,
+        slot_layout: &slots::SlotLayout,
+        width: u16,
+        height: u16,
+    ) -> Option<slots::FloatWindow> {
+        if let Some(picker) = &self.picker {
+            return Some(self.picker_float(picker, width, height));
+        }
+        if let Some(ask) = &self.active_ask {
+            let questions = &ask.request.request.questions;
+            let question = &questions[ask.question_index];
+            let card = crate::ask::format_question_card(
+                question,
+                ask.question_index,
+                questions.len(),
+            );
+            let title = question.header.as_deref().unwrap_or("ask");
+            return Some(self.card_window(title, &card));
+        }
+        if let Some(request) = &self.active_ext {
+            let card = format_extension_ui_prompt(request);
+            return Some(self.card_window(&request.method, &card));
+        }
+        slot_layout
+            .float
+            .as_ref()
+            .and_then(|float| self.slots.float_window(float))
     }
 
     /// The real render pass. Split out of [`Model::view`] so the watchdog can
@@ -5827,12 +5950,6 @@ impl PiFtuiModel {
             header_style,
         )]))
         .render(regions.header, frame);
-
-        // Modal picker takes over the conversation body while open.
-        if let Some(picker) = &self.picker {
-            self.render_picker(picker, &regions, frame);
-            return;
-        }
 
         // Conversation body with tail-follow scroll. `scroll_from_tail == 0`
         // sticks to the bottom; scrolling up pins an offset measured from the
@@ -5985,13 +6102,12 @@ impl PiFtuiModel {
         )]))
         .render(regions.footer, frame);
 
-        // The floating slot is the top z-layer: drawn after everything else
-        // so it covers the transcript and the chrome alike.
-        if let Some(float) = &slot_layout.float
-            && let Some(window) = self.slots.float_window(float)
-        {
+        // The floating window is the top z-layer — picker, card or floated
+        // slot — drawn after everything else so it covers the transcript and
+        // the chrome alike.
+        if let Some(window) = self.float_content(&slot_layout, area.width, area.height) {
             window.render(
-                float.rect,
+                window.rect(area.width, area.height),
                 ftui::Style::new().fg(self.palette.accent),
                 frame,
             );
@@ -12135,6 +12251,63 @@ mod tests {
             Some("staging with canary")
         );
         assert!(reply.response.answers[0].selected.is_empty());
+    }
+
+    /// The ask card lives in the floating window, not the transcript: while
+    /// it is open the frame shows it inside a border and the transcript has
+    /// no card entry; a rejected reply shows in the window; once the question
+    /// settles the transcript gets one compact `question → answer` record.
+    #[test]
+    fn ask_card_floats_and_leaves_a_compact_record_when_it_settles() {
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let (reply_tx, _reply_rx) = mpsc::channel::<AskUiReply>();
+        let model = PiFtuiModel::new(agent_rx).with_ask_reply_channel(reply_tx);
+        drop(agent_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-float",
+            vec![question("Pick a color?", &["red", "blue"], false)],
+        ))));
+        let rendered = buffer_text(sim.capture_frame(60, 14), 60, 14);
+        assert!(rendered.contains("Pick a color?"), "{rendered:?}");
+        assert!(rendered.contains("╭"), "no window border: {rendered:?}");
+        assert!(
+            !sim
+                .model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text.contains("Pick a color?")),
+            "card must not be in the transcript while open"
+        );
+        // A reply mixing a known label with an unknown one is rejected: the
+        // window says so, the transcript still hears nothing.
+        type_str(&mut sim, "red, purple");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().active_ask.is_some(), "question re-asked");
+        let rendered = buffer_text(sim.capture_frame(60, 14), 60, 14);
+        assert!(rendered.contains("! mixed known"), "{rendered:?}");
+        assert!(
+            !sim
+                .model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text.contains("mixed known")),
+            "rejection stays in the window"
+        );
+        type_str(&mut sim, "2");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().active_ask.is_none());
+        let record = sim
+            .model()
+            .transcript
+            .iter()
+            .find(|entry| entry.role == EntryRole::Ask)
+            .expect("settled card recorded");
+        assert_eq!(record.text, "Pick a color?\n  → blue");
+        let rendered = buffer_text(sim.capture_frame(60, 14), 60, 14);
+        assert!(!rendered.contains("╭"), "window closed: {rendered:?}");
     }
 
     #[test]

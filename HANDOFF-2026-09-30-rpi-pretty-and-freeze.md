@@ -1,5 +1,51 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 11, 2026-10-01, iteration-budget handoff)
+
+Branch `fix/bedrock-tool-use-type-and-pijs-compat`. Not pushed. Build 9 still installed (nothing rebuilt).
+Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs` (rustfmt-only diff).
+
+### Floating overlay for ask cards / ext prompts / pickers — WIRING COMPLETE, `cargo check --bin pi` CLEAN ✅
+Everything from session 10's steps 1–4 landed in this commit (`src/interactive_ftui.rs`, `src/interactive_ftui/slots.rs`):
+- `float_content(&slot_layout, width, height)` — precedence picker > ask card > ext card > `/col float` slot — drawn LAST in
+  `render_frame`; the picker early-return + `render_picker` are gone (transcript stays visible under the window).
+- `picker_float(picker, w, h)` (title row + windowed items + `PICKER_HINT` footer, `wanted_cols` = widest row) and free fns
+  `picker_visible_rows(picker, w, h)` / `picker_wanted_cols` / `picker_kind_label`; PageUp/Down page by `picker_visible_rows`
+  at `self.term`. **Renderer sizes from the frame, not `self.term`** — `ProgramSimulator::capture_frame` does not resize.
+- `card_window(title, card)`: heading dim / question bold / options plain / last line (hints) → footer; `card_error` in red.
+- Ext prompt paths (`activate_ext_request`, `submit_ext_answer`, `cancel_active_ext`) no longer push the card; they use
+  `card_error` + `record_card(ext_card_heading(&request), outcome)`. Esc arms reordered: ask → ext → floated slot.
+- `slots::float_window_rect` is `pub(crate)`; `FloatWindow::rect/content_rows/footer/wanted_cols` all have call sites now.
+- New sim test `ask_card_floats_and_leaves_a_compact_record_when_it_settles` (after `ask_free_text_becomes_other_answer`):
+  window border `╭` + question visible, transcript empty while open, `"red, purple"` → `! mixed known` in the window only,
+  `"2"` → one `EntryRole::Ask` entry `"Pick a color?\n  → blue"`, window gone. Not yet type-checked (see below).
+- Static check of existing tests at their frame sizes: `ask_card_collects_answers_across_questions` (50×12 → 40-col ×7-row
+  window, "Pick a color?" fits), `extension_confirm_prompt_renders_and_reply_routes` (50×12, `[demo-ext] confirm: Deploy?`
+  27 cols fits), `long_picker_scrolls_to_keep_the_selection_on_screen` (50×10 → 7-row window, 3 visible items; `(31/40)`,
+  `!model-00` hold), `picker_supports_page_up_page_down` (page = 3 ≥ 1). No test asserts the old `"  → "`/`(dismissed)` strings.
+
+### Bug 4 (macOS `cargo test --lib` won't build) — HALF FIXED in this commit
+rustix 1.1.4 omits `mkfifoat`/`mknodat` on `apple`. `src/artifact_output.rs`: test now calls a new `make_fifo(path)` helper
+(apple → `mkfifo -m 600 <path>` via `std::process::Command`; elsewhere → rustix as before).
+**Still to do: `src/browser/download.rs:481`** — same pattern: replace the `rustix::fs::mkfifoat(rustix::fs::CWD, dir.path().join("fifo"), …)`
+call with a copy of `make_fifo` in that test module (or hoist one helper to a `#[cfg(test)]` spot both can reach — e.g.
+`crate::test_support` if it exists; grep `mod test_support`). Then `cargo test --locked --lib interactive_ftui` finally RUNS
+on macOS: run `interactive_ftui::` and `interactive_ftui::slots::` tests and fix whatever the new float code gets wrong.
+
+### Type-check in flight (NOT observed)
+`cargo check --locked --lib --tests` → `~/.pi/agent-rust/tool-output-artifacts/jobs/job-d9466b111c32405e9c7eb56483ab0e46.log`
+(ends with `EXIT n`). Expected: only `src/browser/download.rs:481 mkfifoat` remains, which still stops rustc before the
+`lib test` target type-checks the new sim test. **Next agent, step 1:** read the log, fix download.rs as above, re-run.
+
+### Then
+Step 2: `cargo test --locked --lib interactive_ftui` on this Mac (first time ever) → fix failures. Step 3: release build in
+`/tmp/pi-release-wt` (`git checkout <sha>`, `export PATH="$HOME/.cargo/bin:$PATH"`, `cargo build --locked --release --bin pi`),
+install via `cp … ~/.local/bin/pi-rust.new && mv -f … pi-rust`; live-check the `ask` tool window, `/model`, `/resume`,
+`/col float todos` + Esc, `/tmp/rpi-quit2.py`, `/tmp/rpi-probe4.py`. Then the unchanged queue: ttfx gate → shimmer
+"Working…" → cycling thinking words / "Thought for Ns" → native colbar panels → read gutter.
+
+---
+
 ## STATUS UPDATE (session 10, 2026-10-01, iteration-budget handoff)
 
 Branch `fix/bedrock-tool-use-type-and-pijs-compat`. Not pushed. Build 9 still installed (nothing rebuilt this session).
