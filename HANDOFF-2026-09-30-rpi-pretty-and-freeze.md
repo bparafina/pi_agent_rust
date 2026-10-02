@@ -1,5 +1,56 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 12, 2026-10-02, iteration-budget handoff) — INVESTIGATION ONLY, NO CODE CHANGES
+
+User report: "sessions eventually come to a hard lock instead of auto-handoff". Two `ask`/approval prompts
+were dismissed, so the lock shape (screen frozen / agent spins / prompt dead after error) is UNCONFIRMED and
+the recent session JSONLs under `~/.pi/agent-rust/sessions/--Users-bparafina-Projects-pi_agent_rust--/`
+(restarts at 12:53, 12:56, 12:57, 13:00 local on 10-02 — the restart cadence itself smells like locks) were
+NOT read. **Next agent, step 1:** get the user's answer to those two questions, or read those files
+(`grep -o '"errorMessage":"[^"]\{0,140\}'`, count `Tool-iteration budget`, `"type":"compaction"`, last entry).
+
+### What "auto-handoff" is today (no native rollover exists — `bd-s9oeu` is still OPEN)
+- `src/agent.rs:3579-3600`: at `iterations >= 80%` of `max_tool_iterations` (default 50 → fires at 40) the
+  run loop pushes `iteration_handoff_steering_text` into the steering queue once per run loop (per user prompt).
+  `src/agent.rs:3601`: at `iterations > max` the turn ends with `StopReason::Error "Maximum tool iterations"`.
+- FTUI: `run_controlled_turn` → `report_turn_result` (`src/interactive_ftui.rs:6983-7080`) sends
+  `PiMsg::AgentError`; `AgentEnd` → `PiMsg::AgentDone` (6325). Nothing there re-prompts or rolls over.
+- `plan-handoff.ts` (`~/.pi/agent-rust/extensions/`) is a different thing (plan→worker→review), not this.
+
+### Findings so far (ranked by how well they explain "hard lock instead of handoff")
+1. **Compaction never runs mid-run-loop.** `maybe_compact` (`agent.rs:14277`) is only called at prompt start
+   (`run_agent_with_prompt_message` 16028, `run_agent_with_text` 16101, +16185). A 50-iteration autonomous run
+   can blow past the window with zero compaction opportunity; the provider then returns a context-overflow
+   400 (`error.rs:1008-1040 is_context_overflow`, classified `ProviderErrorKind::ContextOverflow`, NOT
+   retryable, card says "compact the context (/compact) and resend"). Every subsequent prompt: `maybe_compact`
+   starts a *background* compaction (two-phase; result applied only at the NEXT prompt, 14283) and the prompt
+   itself still goes out with the oversized history → fails again. If the summary request also overflows,
+   `attempt_count` climbs with a 60 s cooldown (`compaction_worker.rs:33-40`, 100 attempts) and
+   `force_local_compaction_if_oversized` (14593) only rescues at **≥ 2× window**
+   (`FORCED_LOCAL_COMPACTION_WINDOW_FACTOR`, `compaction.rs:1787`). A session parked between 1× and 2× is
+   effectively dead = "prompt dead after error" lock. Was about to read `prepare_compaction`
+   (`compaction.rs:1903`) to confirm whether `tokens_before` uses measured usage or the estimate.
+   **Candidate fix:** on a `ContextOverflow` turn result, run a *synchronous* compaction (local fallback if
+   the provider summary fails) and auto-resend once; and/or check `should_compact` at tool-iteration
+   boundaries inside the run loop, not only at prompt start.
+2. **80% steer skips the whole tool batch.** The steer is pushed at 3593, *before* `execute_tool_calls`;
+   `execute_tool_calls` drains steering before the first effect batch (4993-4997) and `break`s, so every
+   tool call the model issued at iteration 40 is replaced with a "Skipped due to steering" result
+   (5053-5055). Functional but surprising — the model loses that turn's work. Not a lock, but worth
+   pushing the steer *after* the batch (`steering_after_tools`) instead.
+3. Frame-guard freeze (build 7 `allow_frame_skip: false`) — `tui.log` shows **0 `SkipFrame` lines on
+   10-01/10-02**, so that fix is holding; the current lock is probably not the renderer.
+4. Noise in `tui.log` 10-02: `Event handler error` from `maturity.ts:75`, `modelbar.ts:140`,
+   `workset.ts:95/125` on every tool_result/turn_end, and periodic `setTimeout callback error: {}`. Unrelated
+   to the lock but they fire on every turn; worth fixing in the extensions.
+
+### Not touched
+No source edits, nothing built, nothing installed (build 9 still live). `src/providers/bedrock/streaming.rs`
+remains uncommitted and NOT mine. The session-11 queue (download.rs mkfifo, `cargo test --lib interactive_ftui`
+on macOS, release build + live-check) is unchanged below.
+
+---
+
 ## STATUS UPDATE (session 13, 2026-10-02, iteration-budget handoff)
 
 Branch `fix/bedrock-tool-use-type-and-pijs-compat`, 23 commits ahead of origin, not pushed. Build of `a72590ba4` installed as
