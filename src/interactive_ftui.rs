@@ -2339,9 +2339,30 @@ const fn picker_kind_label(kind: PickerKind) -> &'static str {
     }
 }
 
+/// Status appended to the picker title: the filter and its match count
+/// whenever one is typed (gh #244), else the position when the list
+/// overflows `visible` rows, else nothing.
+fn picker_status(picker: &PickerOverlay, visible: usize) -> String {
+    let shown = picker.shown.len();
+    if !picker.query.is_empty() {
+        format!(
+            " · filter: {} ({shown}/{})",
+            sanitize(&picker.query),
+            picker.items.len()
+        )
+    } else if shown > visible {
+        format!(" ({}/{shown})", picker.selected.saturating_add(1))
+    } else {
+        String::new()
+    }
+}
+
 /// Inner columns a picker would like: its widest shown row (marker included)
-/// or its title, whichever is longer.
+/// or its title row at its widest (status included), whichever is longer.
+/// The window must not cut the filter or the position off the title row.
 fn picker_wanted_cols(picker: &PickerOverlay) -> u16 {
+    // `visible = 0` yields the status at its widest.
+    let title = display_width(&picker.title) + display_width(&picker_status(picker, 0));
     let widest = picker
         .shown
         .iter()
@@ -2349,7 +2370,7 @@ fn picker_wanted_cols(picker: &PickerOverlay) -> u16 {
         .map(|item| display_width(item) + 2)
         .max()
         .unwrap_or(0)
-        .max(display_width(&picker.title));
+        .max(title);
     u16::try_from(widest).unwrap_or(u16::MAX)
 }
 
@@ -3486,9 +3507,7 @@ impl PiFtuiModel {
                     QuestionReply::Other(text) => (Vec::new(), Some(text)),
                     QuestionReply::Cancel => unreachable!("handled above"),
                 };
-                let outcome = other
-                    .clone()
-                    .unwrap_or_else(|| selected.join(", "));
+                let outcome = other.clone().unwrap_or_else(|| selected.join(", "));
                 self.card_error = None;
                 self.record_card(&question.question, &outcome);
                 let question_id = question.id.clone().unwrap_or_else(|| index.to_string());
@@ -4500,7 +4519,9 @@ impl PiFtuiModel {
         let page = self
             .picker
             .as_ref()
-            .map_or(1, |picker| picker_visible_rows(picker, self.term.0, self.term.1))
+            .map_or(1, |picker| {
+                picker_visible_rows(picker, self.term.0, self.term.1)
+            })
             .max(1);
         match action {
             AppAction::SelectUp => {
@@ -4751,9 +4772,16 @@ impl PiFtuiModel {
             // slot, `lines` (or `text` split on newlines) is the content, and
             // empty content removes it. The layout decides where it draws.
             "setWidget" | "set_widget" => {
-                let id = text_field(&["widgetId", "widget_id", "widgetKey", "widget_key", "id", "name"])
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or_else(|| String::from("widget"));
+                let id = text_field(&[
+                    "widgetId",
+                    "widget_id",
+                    "widgetKey",
+                    "widget_key",
+                    "id",
+                    "name",
+                ])
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| String::from("widget"));
                 let lines: Vec<ftui::text::Line<'static>> = request
                     .payload
                     .get("lines")
@@ -5800,19 +5828,7 @@ impl PiFtuiModel {
         let visible = picker_visible_rows(picker, width, height);
         let shown = picker.shown.len();
         let window = picker_window(picker.selected, shown, visible);
-        // Position when the list overflows the window; the filter and its
-        // match count whenever one is typed (gh #244).
-        let status = if !picker.query.is_empty() {
-            format!(
-                " · filter: {} ({shown}/{})",
-                sanitize(&picker.query),
-                picker.items.len()
-            )
-        } else if shown > visible {
-            format!(" ({}/{shown})", picker.selected.saturating_add(1))
-        } else {
-            String::new()
-        };
+        let status = picker_status(picker, visible);
         let title = if status.is_empty() {
             ftui::text::Line::styled(picker.title.clone(), title_style)
         } else {
@@ -5903,11 +5919,8 @@ impl PiFtuiModel {
         if let Some(ask) = &self.active_ask {
             let questions = &ask.request.request.questions;
             let question = &questions[ask.question_index];
-            let card = crate::ask::format_question_card(
-                question,
-                ask.question_index,
-                questions.len(),
-            );
+            let card =
+                crate::ask::format_question_card(question, ask.question_index, questions.len());
             let title = question.header.as_deref().unwrap_or("ask");
             return Some(self.card_window(title, &card));
         }
@@ -12266,31 +12279,30 @@ mod tests {
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        // A reply mixing a known label with an unknown one is rejected (only
+        // a multi-select question splits on commas): the window says so, the
+        // transcript still hears nothing.
         sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
             "ask-float",
-            vec![question("Pick a color?", &["red", "blue"], false)],
+            vec![question("Pick a color?", &["red", "blue"], true)],
         ))));
         let rendered = buffer_text(sim.capture_frame(60, 14), 60, 14);
         assert!(rendered.contains("Pick a color?"), "{rendered:?}");
         assert!(rendered.contains("╭"), "no window border: {rendered:?}");
         assert!(
-            !sim
-                .model()
+            !sim.model()
                 .transcript
                 .iter()
                 .any(|entry| entry.text.contains("Pick a color?")),
             "card must not be in the transcript while open"
         );
-        // A reply mixing a known label with an unknown one is rejected: the
-        // window says so, the transcript still hears nothing.
         type_str(&mut sim, "red, purple");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert!(sim.model().active_ask.is_some(), "question re-asked");
         let rendered = buffer_text(sim.capture_frame(60, 14), 60, 14);
         assert!(rendered.contains("! mixed known"), "{rendered:?}");
         assert!(
-            !sim
-                .model()
+            !sim.model()
                 .transcript
                 .iter()
                 .any(|entry| entry.text.contains("mixed known")),
@@ -12486,7 +12498,10 @@ mod tests {
             "setWidget",
             serde_json::json!({"widgetKey": "k", "lines": []}),
         );
-        assert!(sim.model().slots.is_empty(), "empty content clears the slot");
+        assert!(
+            sim.model().slots.is_empty(),
+            "empty content clears the slot"
+        );
     }
 
     #[test]
@@ -14304,7 +14319,9 @@ mod tests {
 
         let transcript = &sim.model().transcript;
         assert!(
-            !transcript.iter().any(|e| e.text.contains("Extension early")),
+            !transcript
+                .iter()
+                .any(|e| e.text.contains("Extension early")),
             "the reset rebuilds the transcript; anything sent ahead of it is gone"
         );
         assert!(
@@ -15676,9 +15693,21 @@ mod tests {
         // The trailer stays a single dim line, never tokenized as code.
         assert_eq!(line_of("more lines in file").spans().len(), 1);
         // Icons: folder glyph before the directory, file glyph before the file.
-        assert!(line_of("src/").spans()[0].content.contains('\u{f07b}'));
+        // The needle is the whole span: `"src/"` alone also matches the read
+        // card's `src/main.rs` header above it.
+        let line_of_entry = |entry: &str| {
+            text.lines()
+                .iter()
+                .find(|l| l.spans().iter().any(|s| s.content == entry))
+                .unwrap_or_else(|| panic!("no listing line for {entry:?}"))
+        };
         assert!(
-            line_of("Cargo.toml").spans()[0]
+            line_of_entry("src/").spans()[0]
+                .content
+                .contains('\u{f07b}')
+        );
+        assert!(
+            line_of_entry("Cargo.toml").spans()[0]
                 .content
                 .contains('\u{e615}')
         );

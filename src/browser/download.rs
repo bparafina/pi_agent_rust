@@ -470,7 +470,6 @@ mod tests {
     #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
     #[test]
     fn completed_file_rejects_symlink_and_fifo_leaves() {
-        use rustix::fs::Mode;
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -478,12 +477,33 @@ mod tests {
         std::fs::write(&secret, b"secret").unwrap();
         symlink(&secret, dir.path().join("linked")).unwrap();
         assert!(read_completed(dir.path(), &completed_record("linked", 6.0)).is_err());
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            dir.path().join("fifo"),
-            Mode::RUSR | Mode::WUSR,
-        )
-        .unwrap();
+        make_fifo(&dir.path().join("fifo"));
         assert!(read_completed(dir.path(), &completed_record("fifo", 0.0)).is_err());
+    }
+
+    /// Create a FIFO at `path`. rustix leaves `mkfifoat` out on Apple
+    /// platforms, so there the test shells out to `mkfifo(1)` instead of
+    /// not building at all (which hid every `--lib` test on macOS).
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    fn make_fifo(path: &std::path::Path) {
+        #[cfg(target_vendor = "apple")]
+        {
+            let status = std::process::Command::new("mkfifo")
+                .arg("-m")
+                .arg("600")
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "mkfifo {} failed: {status}",
+                path.display()
+            );
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            use rustix::fs::Mode;
+            rustix::fs::mkfifoat(rustix::fs::CWD, path, Mode::RUSR | Mode::WUSR).unwrap();
+        }
     }
 }
