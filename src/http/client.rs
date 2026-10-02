@@ -699,6 +699,24 @@ pub struct Response {
     timeout_info: Option<(asupersync::Time, std::time::Duration)>,
 }
 
+/// Prefix of the error the body-stream idle timeout yields. `failover.rs`
+/// matches on it to cap same-provider retries, so keep the two in step.
+pub const STREAM_IDLE_TIMEOUT_MESSAGE: &str = "Request timed out reading body stream";
+
+fn stream_idle_timeout_error(
+    idle: std::time::Duration,
+    bytes_received: u64,
+    chunks_received: u64,
+) -> std::io::Error {
+    // The transcript keeps this text, so it must say what the stall looked
+    // like: "0 bytes" means the provider never started the body (long first
+    // token / dead connection); a large count means it stopped mid-stream.
+    std::io::Error::other(format!(
+        "{STREAM_IDLE_TIMEOUT_MESSAGE} (no bytes for {}s; {bytes_received} bytes in {chunks_received} chunks received before the stall)",
+        idle.as_secs()
+    ))
+}
+
 fn wrap_stream_with_idle_timeout(
     stream: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>,
     timeout_info: Option<(asupersync::Time, std::time::Duration)>,
@@ -708,8 +726,8 @@ fn wrap_stream_with_idle_timeout(
     };
 
     Box::pin(futures::stream::unfold(
-        (stream, start_time, timeout),
-        |(mut stream, mut last_activity, timeout)| async move {
+        (stream, start_time, timeout, 0u64, 0u64),
+        |(mut stream, mut last_activity, timeout, mut bytes_received, mut chunks_received)| async move {
             use asupersync::time::{sleep, wall_now};
             use futures::future::{Either, FutureExt, select};
 
@@ -721,10 +739,8 @@ fn wrap_stream_with_idle_timeout(
                 std::time::Duration::from_nanos(asupersync_now.duration_since(last_activity));
             if elapsed >= timeout {
                 return Some((
-                    Err(std::io::Error::other(
-                        "Request timed out reading body stream",
-                    )),
-                    (stream, last_activity, timeout),
+                    Err(stream_idle_timeout_error(elapsed, bytes_received, chunks_received)),
+                    (stream, last_activity, timeout, bytes_received, chunks_received),
                 ));
             }
 
@@ -739,14 +755,19 @@ fn wrap_stream_with_idle_timeout(
                         .and_then(|cx| cx.timer_driver())
                         .map_or_else(wall_now, |timer| timer.now());
                     last_activity = now;
-                    Some((res, (stream, last_activity, timeout)))
+                    if let Ok(bytes) = &res {
+                        bytes_received = bytes_received.saturating_add(bytes.len() as u64);
+                        chunks_received = chunks_received.saturating_add(1);
+                    }
+                    Some((
+                        res,
+                        (stream, last_activity, timeout, bytes_received, chunks_received),
+                    ))
                 }
                 Either::Left((None, _)) => None,
                 Either::Right(_) => Some((
-                    Err(std::io::Error::other(
-                        "Request timed out reading body stream",
-                    )),
-                    (stream, last_activity, timeout),
+                    Err(stream_idle_timeout_error(timeout, bytes_received, chunks_received)),
+                    (stream, last_activity, timeout, bytes_received, chunks_received),
                 )),
             }
         },

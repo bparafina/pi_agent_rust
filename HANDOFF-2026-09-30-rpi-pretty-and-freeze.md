@@ -1,5 +1,58 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 12b, 2026-10-02) — ROOT CAUSE FOUND, FIRST FIX LANDED (uncommitted until the test run lands)
+
+**The hard lock is a Bedrock body-stream stall amplified 4× by the retry policy — not the iteration cap, not
+context overflow.** Evidence from today's rolled sessions (`~/.pi/agent-rust/sessions/--Users-bparafina-Projects-pi_agent_rust--/`):
+- `2026-10-02T15-48-23.979Z_cf1eb878.jsonl` entry 74: assistant `error` at ctx≈103K, a *complete* bash toolCall in content,
+  usage all zero, `Provider error: amazon-bedrock: Bedrock stream transport error: Request timed out reading body stream`.
+  User started a new session 3 min later.
+- `2026-10-02T17-57-40.474Z_4170168a.jsonl` entry 47: same error at ctx≈110K, zero content. Session was re-prompted and
+  continued to 174K afterwards (so the model/context were fine — the stall is intermittent).
+- `compaction=0` in every session; both stalls are far below the 200K−10,240 compaction threshold, so compaction is NOT
+  the lever for these. The 80% steer fired exactly once (17-57 session) and the model did not lock on it.
+Mechanics: `requestTimeoutSecs: 300` is applied as the body **idle** timeout (`src/http/client.rs
+wrap_stream_with_idle_timeout`). `failover.rs::provider_text_is_retryable` matches "timed out" → `decide` → Retry with the
+default `max_retries: 3`, backoff 2/4/8 s. Each replay sends the same 100K+ request to the same stalled model and can burn
+the full 300 s → worst case ≈ 4×300 s + 14 s ≈ **20 min of silence**, then one error card. The FTUI only shows
+`retry n/3: …` system notes (interactive_ftui.rs ~6452) — nothing during the wait. That is the "hard lock".
+Unknown: *why* Bedrock stalls (long first-token/thinking gap with no streamed bytes vs. a gateway dropping the idle
+connection — the `sso-sentinel`/`gateway-meter` extensions suggest traffic goes through a corporate gateway). The new
+error text below is designed to answer that on the next occurrence.
+
+### Landed this session (type-check `cargo check --locked --lib` EXIT 0; `http::client::tests` 128/128 ok)
+- `src/failover.rs`: `STREAM_IDLE_TIMEOUT_MAX_RETRIES = 1`, `is_stream_idle_timeout()`, and `decide` caps the
+  same-provider budget to 1 for that error (one fresh attempt covers a dropped connection; a second identical stall
+  stops instead of replaying). Ordinary transients keep the full budget. Test
+  `stream_idle_timeout_gets_one_same_provider_retry_then_stops` in `recovery_boundary_tests`.
+- `src/http/client.rs`: `pub const STREAM_IDLE_TIMEOUT_MESSAGE`; the idle-timeout error now reads
+  `Request timed out reading body stream (no bytes for 300s; N bytes in M chunks received before the stall)` so the
+  transcript tells "never started the body" apart from "stopped mid-stream". Existing `.contains(...)` tests still match.
+- Test run in flight: `~/.pi/agent-rust/tool-output-artifacts/jobs/job-487eb1c54046479093a3f6cf31d1f5c2.log`
+  (filters `stream_idle_timeout_gets_one_same_provider_retry_then_stops idle_timeout`). **Next agent, step 1:** read it;
+  if green, `git add src/failover.rs src/http/client.rs HANDOFF-*.md && git commit`. Then release build in the worktree
+  (`/tmp/pi-release-wt`, `git checkout <sha>`, `export PATH="$HOME/.cargo/bin:$PATH"`, `cargo build --locked --release
+  --bin pi`) and install with `cp … pi-rust.new && mv -f … pi-rust`.
+
+### Still to do for "no more manual rolls" (in order)
+1. **Make the stall visible**: status line should show `waiting on amazon-bedrock · idle 1m47s · Esc interrupts` while
+   no provider bytes arrive (hook: `PiMsg` from `AgentEvent::MessageUpdate` deltas resets a last-byte clock; the
+   existing tick renders elapsed). Today the user sees a frozen "working" for minutes.
+2. **Separate idle timeout from header timeout**, or at least recommend `requestTimeoutSecs: 120`: 300 s idle only
+   makes sense if genuine 4-minute gaps exist; with the retry cap above, 120 s bounds the lock to ~4 min.
+3. **Automatic resumption after a stalled turn (bd-s9oeu, owned by the OTHER agent — coordinate, don't duplicate)**:
+   the user said "while auto-rollover is worked by a diff agent" in session 4170168a. What this lane should feed them:
+   on retry exhaustion for a stall, the natural rollover is compaction (shrinks the context the stall correlates with:
+   both stalls hit right after crossing 100K) followed by one continue nudge — `compact_local` is provider-free so it
+   works while the provider is unreachable. Also: `maybe_compact` runs only at prompt start (agent.rs 16028/16101/16185),
+   never between tool iterations — a 50-iteration run cannot compact mid-flight; and a `ContextOverflow` turn is
+   non-retryable with no auto-compact+resend (`error.rs:1280` tells the user to `/compact` by hand). Both belong in the
+   rollover work.
+4. 80% steer skips the tool batch it interrupts (`agent.rs:3593` pushes before `execute_tool_calls`, which drains at
+   4993 and `break`s → all calls "Skipped due to steering"). Move the steer to `steering_after_tools`.
+
+---
+
 ## STATUS UPDATE (session 12, 2026-10-02, iteration-budget handoff) — INVESTIGATION ONLY, NO CODE CHANGES
 
 User report: "sessions eventually come to a hard lock instead of auto-handoff". Two `ask`/approval prompts

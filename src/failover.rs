@@ -105,6 +105,19 @@ fn response_refuses_retry(lower: &str) -> bool {
         .is_some_and(|status| (400..=499).contains(&status) && !matches!(status, 408 | 429))
 }
 
+/// Same-provider retries allowed for a body-stream idle timeout, regardless
+/// of `RetryPolicy::max_retries`. One retry covers a silently dropped
+/// connection; more only replays a stalled request against the same model.
+pub const STREAM_IDLE_TIMEOUT_MAX_RETRIES: u32 = 1;
+
+/// Whether an error text is the HTTP client's body-stream idle timeout
+/// (`src/http/client.rs` `wrap_stream_with_idle_timeout`), possibly wrapped by
+/// a provider prefix such as `Bedrock stream transport error: …`.
+#[must_use]
+pub fn is_stream_idle_timeout(error_text: &str) -> bool {
+    error_text.contains(crate::http::client::STREAM_IDLE_TIMEOUT_MESSAGE)
+}
+
 /// Text-only recovery after the caller has ruled out authentication and
 /// durability failures. Keep the old prose matcher, but do not feed it numeric
 /// request ids, durations or token counts as if they were HTTP status codes.
@@ -1109,7 +1122,23 @@ pub fn decide(
             progress.retry_count.saturating_add(1),
         ),
     };
-    let budget_left = progress.retry_count < policy.max_retries && progress.stream_can_retry;
+    let error_text_for_budget = match outcome {
+        TurnOutcome::Completed(message) => message.error_message.clone().unwrap_or_default(),
+        TurnOutcome::Failed(error) => error.to_string(),
+    };
+    // A body-stream idle timeout is the one transient that gets *worse* with
+    // the standard budget. The connection may have been dropped silently
+    // (worth one fresh attempt), but if the provider genuinely stalled on this
+    // request, every replay stalls the same way and each attempt can burn the
+    // whole idle timeout: with `requestTimeoutSecs = 300` and three retries
+    // that was ~20 minutes of silence before the user saw anything
+    // (2026-10-02 sessions cf1eb878 / 4170168a, both at 100K+ context).
+    let same_provider_cap = if is_stream_idle_timeout(&error_text_for_budget) {
+        policy.max_retries.min(STREAM_IDLE_TIMEOUT_MAX_RETRIES)
+    } else {
+        policy.max_retries
+    };
+    let budget_left = progress.retry_count < same_provider_cap && progress.stream_can_retry;
     // A fallback also re-enters the provider. A surface that cannot retract
     // visible output must not bypass its no-retry boundary by changing models.
     let may_fail_over =
@@ -1220,6 +1249,53 @@ mod recovery_boundary_tests {
             failovers_this_turn: 0,
             stream_can_retry,
         }
+    }
+
+    #[test]
+    fn stream_idle_timeout_gets_one_same_provider_retry_then_stops() {
+        // 2026-10-02: a Bedrock stall at 100K+ context was replayed three
+        // times, each burning the full 300 s idle timeout — ~20 min of silence.
+        let text = format!(
+            "Bedrock stream transport error: {} (no bytes for 300s; 0 bytes in 0 chunks received before the stall)",
+            crate::http::client::STREAM_IDLE_TIMEOUT_MESSAGE
+        );
+        let mut message = failure();
+        message.error_message = Some(text.clone());
+        let error = crate::error::Error::provider("amazon-bedrock", text);
+        let policy = RetryPolicy {
+            max_retries: 3,
+            max_failovers_per_turn: 0,
+            ..policy()
+        };
+        for outcome in [
+            TurnOutcome::Completed(&message),
+            TurnOutcome::Failed(&error),
+        ] {
+            // First failure: one fresh attempt covers a dropped connection.
+            assert!(matches!(
+                decide(outcome, &progress(true), &policy, Some(200_000)),
+                TurnDecision::Retry { attempt: 1, .. }
+            ));
+            // Second identical stall: stop, do not replay it again.
+            let spent = TurnProgress {
+                retry_count: 1,
+                ..progress(true)
+            };
+            assert_eq!(
+                decide(outcome, &spent, &policy, Some(200_000)),
+                TurnDecision::Finish { success: false }
+            );
+        }
+        // An ordinary transient keeps the full budget.
+        let plain = crate::error::Error::api("503 service unavailable");
+        let spent = TurnProgress {
+            retry_count: 1,
+            ..progress(true)
+        };
+        assert!(matches!(
+            decide(TurnOutcome::Failed(&plain), &spent, &policy, Some(200_000)),
+            TurnDecision::Retry { attempt: 2, .. }
+        ));
     }
 
     #[test]
