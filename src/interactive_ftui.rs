@@ -63,6 +63,7 @@ use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use std::collections::{HashMap, VecDeque};
 
 mod info_commands;
+mod live_work;
 mod plan_commands;
 pub mod session_pins;
 mod slots;
@@ -138,6 +139,11 @@ const AGENT_EVENT_POLL: Duration = Duration::from_millis(50);
 
 /// Spinner animation cadence while the agent works.
 const SPINNER_INTERVAL: Duration = Duration::from_millis(120);
+
+/// How often the tick re-reads the job and agent-hub registries while
+/// background work is live (bd-b6bja). The rows animate every tick with the
+/// shared spinner; the registry locks are taken only this often.
+const LIVE_WORK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Key hint shown in the footer while a picker overlay is open.
 const PICKER_HINT: &str = "type to filter · ↑/↓ navigate · Enter apply · Esc close";
@@ -2190,6 +2196,19 @@ pub struct PiFtuiModel {
     /// reply clears it (the driver is sequential, so the next non-tick
     /// message belongs to the in-flight operation).
     busy: Option<BusyOp>,
+    /// Background work shown in the floating card (bd-b6bja): live bash
+    /// jobs and subagent delegations, polled from the registries on the
+    /// tick while anything is live and parked otherwise.
+    live_work: live_work::LiveWork,
+    /// Whether the registries are read at all. Off by default so simulator
+    /// tests see only what they inject; the launch path turns it on.
+    live_work_tracking: bool,
+    /// When the registries were last read; polls are throttled to
+    /// [`LIVE_WORK_POLL_INTERVAL`] on the tick, read immediately on events.
+    live_work_polled: Option<Instant>,
+    /// Set by a routing helper that just started background work (`/tan`)
+    /// and consumed by the key path's Cmd return, like `BusyOp::tick_pending`.
+    live_work_tick_pending: bool,
     /// Transcript markdown spacing policy (issue #202), resolved from
     /// `markdown.spacing` in settings at launch.
     markdown_spacing: crate::config::MarkdownSpacing,
@@ -2504,6 +2523,10 @@ impl PiFtuiModel {
             render_cache_width: std::cell::Cell::new(0),
             render_stats: std::cell::Cell::new((0, 0)),
             busy: None,
+            live_work: live_work::LiveWork::default(),
+            live_work_tracking: false,
+            live_work_polled: None,
+            live_work_tick_pending: false,
             markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
             #[cfg(test)]
             suspend_task_override: None,
@@ -2624,6 +2647,16 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_ask_reply_channel(mut self, tx: Sender<AskUiReply>) -> Self {
         self.ask_reply_tx = Some(tx);
+        self
+    }
+
+    /// Read the job and agent-hub registries for the live-work card
+    /// (bd-b6bja). The launch path enables this; simulator tests leave it off
+    /// and feed [`Self::absorb_live_work`] directly, so a subagent test
+    /// running in the same process can never put a window in their frames.
+    #[must_use]
+    pub const fn with_live_work_tracking(mut self, enabled: bool) -> Self {
+        self.live_work_tracking = enabled;
         self
     }
 
@@ -3239,6 +3272,12 @@ impl PiFtuiModel {
                 let diff_styled = matches!(name.as_str(), "edit" | "hashline_edit");
                 self.finish_tool_card(&pair, &name, !is_error, output, diff_styled);
                 self.current_tool = None;
+                // Tools that start or settle background work: read the
+                // registries now so the card shows the job on the next frame
+                // rather than up to a poll interval later.
+                if matches!(name.as_str(), "bash" | "jobs" | "hub" | "subagent") {
+                    self.poll_live_work(true);
+                }
             }
             PiMsg::TodoSummary { summary } => {
                 self.todo_summary = summary.map(|s| sanitize(&s).into_owned());
@@ -3265,6 +3304,9 @@ impl PiFtuiModel {
                 self.thinking.clear();
                 self.drain_deferred_notes();
                 self.settle_pending_cards();
+                // The turn is over; whether the tick chain keeps going now
+                // depends on what is still running in the background.
+                self.poll_live_work(true);
             }
             PiMsg::AgentError(err) => {
                 self.dismiss_pending_interactions();
@@ -3305,6 +3347,10 @@ impl PiFtuiModel {
                     } else {
                         self.push_entry(EntryRole::System, text);
                     }
+                    // `/tan` and `/btw` answers arrive this way; the child
+                    // that produced one has just settled, so its row leaves
+                    // the card with the note rather than a poll later.
+                    self.poll_live_work(true);
                 }
             }
             PiMsg::ConversationReset {
@@ -3314,8 +3360,14 @@ impl PiFtuiModel {
                 ..
             } => {
                 self.dismiss_pending_interactions();
+                if self.displayed_session_id.as_deref() != Some(session_id.as_str()) {
+                    // Another session's work is not this transcript's to
+                    // record; the jobs registry is keyed by owner anyway.
+                    self.live_work.clear();
+                }
                 self.displayed_session_id = Some(session_id);
                 self.apply_conversation_reset(messages, status);
+                self.poll_live_work(true);
             }
             PiMsg::RetryCommitted {
                 session_id,
@@ -3468,6 +3520,74 @@ impl PiFtuiModel {
         let outcome = sanitize(outcome.trim()).into_owned();
         self.push_entry(EntryRole::Ask, format!("{heading}\n  → {outcome}"));
         self.scroll_from_tail = 0;
+    }
+
+    /// Unix milliseconds now, the clock the registries stamp `started_ms` in.
+    fn unix_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// Re-read the registries for the live-work card (bd-b6bja). `force`
+    /// skips the tick throttle: events that change the set (a tool ended, a
+    /// turn ended, a note arrived) read immediately so the card and the
+    /// tick condition are right on the frame that follows them.
+    fn poll_live_work(&mut self, force: bool) {
+        if !self.live_work_tracking {
+            return;
+        }
+        let now = Instant::now();
+        if !force
+            && self
+                .live_work_polled
+                .is_some_and(|last| now.duration_since(last) < LIVE_WORK_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.live_work_polled = Some(now);
+        let snapshot = live_work::snapshot(self.displayed_session_id.as_deref());
+        self.absorb_live_work(snapshot);
+    }
+
+    /// Apply a snapshot of background work: new live items join the card,
+    /// settled ones leave it and get a compact transcript record — `✓ job
+    /// job-d9466b11… cargo test · 18m04s · exit 0` / `✗ … · exit 101`.
+    fn absorb_live_work(&mut self, snapshot: Vec<live_work::WorkItem>) {
+        let records = self.live_work.apply(snapshot, Self::unix_now_ms());
+        for record in records {
+            let text = sanitize(&record.text).into_owned();
+            if record.ok {
+                self.push_entry(EntryRole::Ask, format!("✓ {text}"));
+            } else {
+                self.push_entry(EntryRole::Error, text);
+            }
+        }
+    }
+
+    /// The live-work card, if anything is running: one row per item, an
+    /// optional dim output tail under each job. Display-only; no footer
+    /// hints because it owns no key.
+    fn live_work_window(&self) -> Option<slots::FloatWindow> {
+        if self.live_work.count() == 0 {
+            return None;
+        }
+        let spin = DOTS[self.spinner.current_frame % DOTS.len()];
+        let rows = self.live_work.rows(Self::unix_now_ms(), spin);
+        let head_style = ftui::Style::new().fg(self.palette.warning);
+        let tail_style = ftui::Style::new().dim().fg(self.palette.muted);
+        let mut widest: u16 = 0;
+        let mut lines = Vec::with_capacity(rows.len() * 2);
+        for row in rows {
+            widest = widest.max(u16::try_from(display_width(&row.head)).unwrap_or(u16::MAX));
+            lines.push(ftui::text::Line::styled(row.head, head_style));
+            if let Some(tail) = row.tail {
+                widest = widest.max(u16::try_from(display_width(&tail)).unwrap_or(u16::MAX));
+                lines.push(ftui::text::Line::styled(tail, tail_style));
+            }
+        }
+        let title = format!("background · {}", self.live_work.count());
+        Some(slots::FloatWindow::new(title, lines).wanted_cols(widest))
     }
 
     fn send_ask_reply(&self, request_id: String, answers: Vec<AskAnswer>, dismissed: bool) {
@@ -4230,6 +4350,10 @@ impl PiFtuiModel {
                 // arrives as a system entry at the next turn boundary.
                 self.push_entry(EntryRole::System, format!("(/tan started) {work}"));
                 self.send_command(UiCommand::Tan(work.to_string()));
+                // The child registers with the hub asynchronously; keep the
+                // tick chain alive long enough to see it appear (bd-b6bja).
+                self.live_work.expect(Instant::now());
+                self.live_work_tick_pending = true;
                 return true;
             }
             "/login" => {
@@ -4893,9 +5017,13 @@ impl PiFtuiModel {
     /// Split from [`Self::begin_busy`] because the routing helpers return
     /// `bool`/`()` — only `update()`'s key paths own Cmd returns.
     fn take_busy_tick(&mut self) -> Cmd<PiFtuiMsg> {
+        let live_work_kick = std::mem::take(&mut self.live_work_tick_pending);
         if let Some(op) = &mut self.busy
             && std::mem::take(&mut op.tick_pending)
         {
+            Cmd::tick(SPINNER_INTERVAL)
+        } else if live_work_kick {
+            // `/tan` just started background work (bd-b6bja).
             Cmd::tick(SPINNER_INTERVAL)
         } else {
             Cmd::none()
@@ -4929,8 +5057,12 @@ impl PiFtuiModel {
                 if self.state == AgentUiState::Working
                     || self.busy.is_some()
                     || self.has_pending_cards()
+                    || self.live_work.is_active(Instant::now())
                 {
                     self.spinner.tick();
+                    // Throttled inside: the rows animate every tick, the
+                    // registries are read every LIVE_WORK_POLL_INTERVAL.
+                    self.poll_live_work(false);
                     return Cmd::tick(SPINNER_INTERVAL);
                 }
                 return Cmd::none();
@@ -5928,6 +6060,11 @@ impl PiFtuiModel {
             let card = format_extension_ui_prompt(request);
             return Some(self.card_window(&request.method, &card));
         }
+        // Live background work (bd-b6bja) outranks a floated slot but never
+        // a card collecting a reply: it is display-only and owns no key.
+        if let Some(window) = self.live_work_window() {
+            return Some(window);
+        }
         slot_layout
             .float
             .as_ref()
@@ -6027,6 +6164,12 @@ impl PiFtuiModel {
             self.todo_summary
                 .as_ref()
                 .map_or_else(String::new, |todo| format!("todo {todo}"))
+        };
+        // Background-work chip (bd-b6bja): `⟳ N` while anything is live.
+        let status_line = match self.live_work.count() {
+            0 => status_line,
+            n if status_line.is_empty() => format!("⟳ {n}"),
+            n => format!("{status_line} · ⟳ {n}"),
         };
         // The powerline (OMP-ADOPT bd-cv653.9.4) fills the rest of the row:
         // model, thinking, mode, path, VCS, context, cost.
@@ -9649,6 +9792,7 @@ pub fn run(
         .with_thinking_visible(!hide_thinking_block)
         .with_double_escape_action(double_escape_action)
         .with_autocomplete(autocomplete)
+        .with_live_work_tracking(true)
         .with_ext_reply_channel(ext_reply_tx);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen

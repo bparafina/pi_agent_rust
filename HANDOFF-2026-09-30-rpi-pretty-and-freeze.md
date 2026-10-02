@@ -1,5 +1,45 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 13, 2026-10-02, iteration-budget handoff)
+
+Branch `fix/bedrock-tool-use-type-and-pijs-compat`, 23 commits ahead of origin, not pushed. Build of `a72590ba4` installed as
+`~/.local/bin/pi-rust` (12:45). Still uncommitted and NOT mine: `src/providers/bedrock/streaming.rs` (rustfmt-only).
+User's chosen order for this and the next sessions: **(1) bd-b6bja jobs/subagent float card → (2) shimmer "Working…" +
+cycling thinking words / "Thought for Ns" → (3) native colbar panels + read gutter.** Load average was ~100 all session.
+
+### (1) bd-b6bja — live background-work float card: CODE COMPLETE, **NOT TYPE-CHECKED, NO SIM TEST YET**
+Landed in this commit:
+- NEW `src/interactive_ftui/live_work.rs` (pure half, 6 unit tests): `WorkItem{key,kind,id,label,started_ms,tail,outcome}`,
+  `LiveWork::{apply,rows,is_active,expect,clear,count}`, `job_item(&JobSnapshot)`, `child_item(&agent_hub::ChildEntry)`,
+  `snapshot(owner_session_id)` (reads `jobs::list` + `agent_hub::registry().roster()`). Only items *observed live* are ever
+  recorded; vanished items record as `· gone`. Rows: `⠋ job job-d9466b11…   2.5s  cargo test --lib` + dim tail line.
+  Deviation from the bead text: rows show **elapsed**, not a HH:MM start time (timezone-free; same clock as card `· 1.2s`).
+- `src/interactive_ftui.rs`: fields `live_work`, `live_work_tracking` (off by default; launch path sets
+  `.with_live_work_tracking(true)` so sim tests never see the process-global hub roster), `live_work_polled`,
+  `live_work_tick_pending`; const `LIVE_WORK_POLL_INTERVAL = 500ms`; methods `poll_live_work(force)`, `absorb_live_work(snapshot)`
+  (✓ → `EntryRole::Ask` `"✓ job … · 18m04s · exit 0"`, ✗ → `EntryRole::Error` whose prefix supplies the ✗), `live_work_window()`
+  (title `background · N`, `wanted_cols` = widest row, no footer). Wiring: Tick condition now includes
+  `live_work.is_active(now)` and calls `poll_live_work(false)`; `ToolEnd` for `bash|jobs|hub|subagent`, `AgentDone`,
+  `SessionSystemNote`, `ConversationReset` (clears on session-id change) all `poll_live_work(true)`; `/tan` arms
+  `live_work.expect(now)` (5 s grace) + `live_work_tick_pending`, consumed in `take_busy_tick`; `float_content` precedence
+  picker > ask > ext > **live-work card** > floated slot; status chip `⟳ N` appended to the status line.
+- No Esc/key handling on purpose — display-only; Esc keeps its existing meaning (interrupt turn / rewind).
+
+**Next agent, step 1:** `cargo check --locked --lib --tests` (expect small fixes: possibly `format_elapsed` visibility from the
+child module is fine since it's `super::`; `ChildStatus::as_str` exists; `JobSnapshot: Clone` yes). Then
+`cargo test --locked --lib interactive_ftui` (247 were green at HEAD~1). Step 2: add a sim test next to
+`ask_card_floats_and_leaves_a_compact_record_when_it_settles` (~line 12330): build `PiFtuiModel::new(rx)` (tracking off), call
+`sim.model_mut().absorb_live_work(vec![live job item])` → frame contains `╭`, `background · 1`, the row, status `⟳ 1`;
+inject `Event::Tick` → Cmd is a tick (chain alive while idle); absorb the settled snapshot → `EntryRole::Ask` record
+`"✓ job job-1 cargo test … · exit 0"`, window gone, next Tick returns `Cmd::none()`. Step 3: release build in `/tmp/pi-release-wt`,
+install (`cp … pi-rust.new && mv -f`), live-check: `bash {background:true, command:"sleep 20; echo hi"}` via a prompt, `/tan`,
+and a `subagent` delegation; confirm zero ticks when idle with nothing live (`RUST_LOG=ftui_runtime=info`).
+Then close bd-b6bja with the commit sha, `br sync --flush-only`.
+
+### Then (2) shimmer + thinking words, (3) colbar panels + read gutter — design unchanged, see "Pi-rust sugar — revised design".
+
+---
+
 ## STATUS UPDATE (session 11, 2026-10-01, iteration-budget handoff)
 
 Branch `fix/bedrock-tool-use-type-and-pijs-compat`. Not pushed. Build 9 still installed (nothing rebuilt).
