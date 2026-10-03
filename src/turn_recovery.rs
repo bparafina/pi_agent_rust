@@ -679,8 +679,7 @@ mod tests {
             IterationRolloverMode::default(),
             IterationRolloverMode::Continue
         );
-        let parsed: IterationRolloverMode =
-            serde_json::from_str("\"stop\"").expect("stop parses");
+        let parsed: IterationRolloverMode = serde_json::from_str("\"stop\"").expect("stop parses");
         assert_eq!(parsed, IterationRolloverMode::Stop);
         let parsed: IterationRolloverMode =
             serde_json::from_str("\"continue\"").expect("continue parses");

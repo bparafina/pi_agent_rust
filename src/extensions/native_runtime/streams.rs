@@ -35,13 +35,14 @@ impl fmt::Debug for StreamRegistry {
             .debug_struct("StreamRegistry")
             .field("active", &self.active.len())
             .field("completed", &self.completed.len())
+            .field("completion_order", &self.completion_order.len())
             .finish()
     }
 }
 
 fn allocate_id(sequence: &AtomicU64) -> Result<String> {
     let previous = sequence
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| {

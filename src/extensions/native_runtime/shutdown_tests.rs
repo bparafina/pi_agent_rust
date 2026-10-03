@@ -86,6 +86,7 @@ fn shutdown_releases_descriptors_stream_payloads_flags_and_indexes() {
     assert!(state.flags.is_empty());
     assert!(state.repair_events.is_empty());
     assert!(state.streams.next(&id).is_err());
+    drop(state);
 }
 
 #[test]
