@@ -1,5 +1,49 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 16, 2026-10-02, iteration-budget handoff)
+
+Resumed **bd-s9oeu** from the session-15 plan. Session 15's `turn_recovery.rs`/`config.rs` groundwork was on disk but had
+NOT actually been committed (the handoff said it was) — it is committed now together with this session's `agent.rs` work.
+**Nothing in this commit is type-checked** (`cargo`/`dsr`/`ubs` not run; see host notes in session 15).
+
+### Done this session (bd-s9oeu steps 1–3, `src/agent.rs`)
+- `use crate::turn_recovery::{ITERATION_ROLLOVER_MAX_DEFAULT, IterationRolloverMode, budget_checkpoint_marker,
+  budget_warning_text, rollover_ceiling_text, rollover_nudge_text}` added (~L51). `ITERATION_ROLLOVER_MAX_DEFAULT`,
+  `rollover_ceiling_text`, `rollover_nudge_text` are imported for step 4 and are **unused until step 4 lands** — clippy
+  will flag them if you don't finish step 4.
+- `Agent` fields `iteration_rollover: IterationRolloverMode` (default **Stop** in `with_shared_tools`) and
+  `iteration_budget_exhausted: bool`; `set_iteration_rollover`, `iteration_rollover()`, `take_iteration_budget_exhausted()`
+  next to `automatic_queue_dispatch` (~L2335).
+- `iteration_handoff_steering_text` now delegates to `budget_warning_text(Stop, …)` (one source of truth; existing test
+  at ~L19413 still pins the prefix).
+- `run_loop_inner`: `pending_budget_warning: Option<QueuedAgentMessage>` local + `self.iteration_budget_exhausted = false`
+  at the top. 80% warning no longer `push_steering`s; it is held and `pending_messages.insert(0, w)` right after the
+  `steering_after_tools` consume (~L3815) — this is the bd-yrcqj #3 fix for "Skipped due to queued user message".
+- Cap block (~L3660): `rollover = self.iteration_rollover == Continue`; `error_message: Option<String>` is `None` in
+  Continue mode; Continue → `stop_reason = Stop`, pushes `Text(budget_checkpoint_marker(max))`, sets the flag;
+  Stop mode byte-for-byte legacy. `AgentEnd { error: error_message }`.
+
+### Next agent — remaining steps (design fixed; one decision added)
+4. `AgentSession` (struct ~L5924, `new` ~L12718): field `iteration_rollover_max: u32` default `ITERATION_ROLLOVER_MAX_DEFAULT`
+   + `set_iteration_rollover_max`. Helper `continue_after_iteration_budget(result, abort, on_event) -> Result<AssistantMessage>`:
+   `while result.is_ok() && self.agent.take_iteration_budget_exhausted()`: break if aborted; `budget = agent max_tool_iterations`
+   (needs an `Agent::max_tool_iterations()` accessor or `config()` — grep `pub fn config(&self)` first); if `rollovers >= max`
+   → **persist a `Message::Custom(CustomMessage { content: rollover_ceiling_text(max, budget), custom_type:
+   ITERATION_ROLLOVER_SCHEMA, display: true, .. })`** via `append_model_message` + `flush_autosave(Manual)` and emit
+   MessageStart/MessageEnd for it, then break (decision: Custom message, not a user message — no orphan user turn);
+   else `rollovers += 1`; `self.maybe_compact(on_event)`; re-sync `agent.replace_messages(session.to_messages_for_current_path())`;
+   `start_len = agent.messages().len()`; persist `Message::User(rollover_nudge_text(rollovers, max, budget))`;
+   `AtomicBoolGuard::activate(&self.extensions_is_streaming)`; `run_with_messages_with_abort(vec![nudge], abort.clone(), …)`;
+   `persist_turn_artifacts(start_len + 1, run.is_err(), run_incomplete)`; `result = finish_turn_persistence(run, persist)`.
+   Call it in place of the final `finish_turn_persistence(result, persist_result)` in `run_agent_with_prompt_message`
+   (~L16153), `run_agent_with_text` (~L16237), `run_agent_with_content` (~L16321):
+   `let result = finish_turn_persistence(result, persist_result); self.continue_after_iteration_budget(result, abort, on_event).await`
+   (note `abort` is moved into the run — `.clone()` it before the run).
+5–8. Unchanged from session 15 (wire main.rs/sdk.rs/rpc.rs/acp.rs; tests; docs; `cargo check --locked --all-targets
+   --keep-going`; release build + live `PI_MAX_TOOL_ITERATIONS=3 rpi` check; then bd-yrcqj, Bedrock-stall items, bd-w85u3).
+
+---
+
 ## STATUS UPDATE (session 15, 2026-10-02, iteration-budget handoff)
 
 User goal set this session: **work the beads continuously until all features are complete; prioritize the work that lets an agent
