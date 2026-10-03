@@ -199,7 +199,22 @@ impl Decoder {
             event,
             AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. }
         );
-        let output = ExtensionStreamSimpleProvider::assistant_event_to_stream_event(event);
+        let mut output = ExtensionStreamSimpleProvider::assistant_event_to_stream_event(event);
+        // Some OpenAI-compatible backends finish a tool turn with `stop`
+        // rather than `tool_calls`. The native OpenAI path accepts that
+        // combination; mirror it here by normalizing to an explicit tool-use
+        // terminal so the agent dispatches the calls exactly as it would for a
+        // native provider.
+        if let StreamEvent::Done { reason, message } = &mut output
+            && *reason == StopReason::Stop
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        {
+            *reason = StopReason::ToolUse;
+            message.stop_reason = StopReason::ToolUse;
+        }
         if terminal {
             self.mode = Mode::Finished;
         }
@@ -296,9 +311,15 @@ fn validate_event(event: &AssistantMessageEvent) -> Result<()> {
                 if let ContentBlock::ToolCall(call) = block {
                     // PauseTurn is a server-tool continuation, not local tool
                     // authorization. Preserve its payload for verbatim replay.
-                    if !matches!(reason, StopReason::ToolUse | StopReason::PauseTurn) {
+                    // Stop is accepted because OpenAI-compatible backends
+                    // commonly finish a tool turn with `stop`; the decoder
+                    // normalizes it to ToolUse after validation.
+                    if !matches!(
+                        reason,
+                        StopReason::ToolUse | StopReason::PauseTurn | StopReason::Stop
+                    ) {
                         return Err(protocol(
-                            "tool calls require an explicit tool-use or paused-turn terminal reason",
+                            "tool calls require a tool-use, stop or paused-turn terminal reason",
                         ));
                     }
                     if call.id.trim().is_empty()

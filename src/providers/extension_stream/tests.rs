@@ -185,7 +185,6 @@ fn tool_execution_requires_explicit_consistent_tool_use_completion() {
         if matches!(&message.content[0], ContentBlock::ToolCall(call) if call.arguments["content"] == "complete"))
     );
     for reason in [
-        StopReason::Stop,
         StopReason::Length,
         StopReason::Refusal,
         StopReason::Error,
@@ -203,6 +202,38 @@ fn tool_execution_requires_explicit_consistent_tool_use_completion() {
             .push(done(Arc::new(empty), StopReason::ToolUse))
             .is_err()
     );
+}
+
+/// OpenAI-compatible backends often end a tool turn with `stop` instead of
+/// `tool_calls`; the native OpenAI path accepts that, so extension providers
+/// must too. The terminal is normalized to ToolUse so the agent dispatches it.
+#[test]
+fn stop_terminal_with_tool_calls_is_normalized_to_tool_use() {
+    let mut stream_decoder = decoder();
+    let terminal = stream_decoder
+        .push(done(tool_message(StopReason::Stop), StopReason::Stop))
+        .unwrap();
+    let StreamEvent::Done { reason, message } = &terminal[0] else {
+        panic!("missing done")
+    };
+    assert_eq!(*reason, StopReason::ToolUse);
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
+    assert!(
+        matches!(&message.content[0], ContentBlock::ToolCall(call) if call.arguments["content"] == "complete")
+    );
+    assert!(stream_decoder.finished());
+
+    // A plain Stop without tool calls is left untouched.
+    let events = decoder()
+        .push(done(text_message("plain"), StopReason::Stop))
+        .unwrap();
+    assert!(matches!(
+        &events[0],
+        StreamEvent::Done {
+            reason: StopReason::Stop,
+            ..
+        }
+    ));
 }
 
 #[test]
