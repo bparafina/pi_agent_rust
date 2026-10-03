@@ -468,7 +468,11 @@ mod tests {
                 .arg(path)
                 .status()
                 .unwrap();
-            assert!(status.success(), "mkfifo {} failed: {status}", path.display());
+            assert!(
+                status.success(),
+                "mkfifo {} failed: {status}",
+                path.display()
+            );
         }
         #[cfg(not(target_vendor = "apple"))]
         {

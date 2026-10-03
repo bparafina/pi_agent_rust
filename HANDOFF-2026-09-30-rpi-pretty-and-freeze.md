@@ -1,5 +1,70 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 15, 2026-10-02, iteration-budget handoff)
+
+User goal set this session: **work the beads continuously until all features are complete; prioritize the work that lets an agent
+work continuously.** Keystone is **bd-s9oeu** (in_progress, mine). Design decision taken (ask card timed out → recommended
+option): **auto-continue in place**, not a successor-session chain. The chain/`/resume` part of bd-s9oeu becomes a follow-up bead.
+
+### Done this session
+- bd-b6bja **closed**: release `7c6b5c929` built (63 min, 36.6 MB) and installed as `~/.local/bin/pi-rust`; live pty check passed
+  (float `background · 1`, `⟳ 1` chip, `✓ job … · exit 0`, no `· gone`). UBS is not installed on this host (`which ubs` empty);
+  static review only — recorded in the close reason.
+- Filed **bd-w85u3** (P2): FTUI tick chain never parks after ANY turn (120 ms empty-diff frames forever; repro
+  `/tmp/rpi-idle-probe3.py "Reply with exactly the single word: pong"` → 99 chunks in 12 s idle; pre-prompt idle is silent).
+- Filed **bd-yrcqj** (P1): Enter mid-turn skips the in-flight tool batch ("Skipped due to queued user message") — queue after tools.
+- **bd-s9oeu partial, committed in this handoff commit, NOT type-checked** (no cargo run; `dsr`/`ubs` absent on host):
+  - `src/turn_recovery.rs`: `IterationRolloverMode { Stop, Continue(default) }`, `ITERATION_ROLLOVER_MAX_DEFAULT = 20`,
+    `budget_warning_text(mode, cur, max)` (keeps the `Tool-iteration budget at >=80%` prefix the existing test at
+    agent.rs ~19355 pins), `budget_checkpoint_marker`, `rollover_nudge_text`, `rollover_ceiling_text` + 3 unit tests.
+  - `src/config.rs`: `iteration_rollover` / `iteration_rollover_max` fields (aliases `iterationRollover`, `iterationRolloverMax`),
+    merge arms, accessors `iteration_rollover_mode()` (max==0 ⇒ Stop) and `iteration_rollover_max()`.
+    **Check:** any `Config { … }` struct literal without `..Default::default()` now fails to compile — grep and add the two fields.
+
+### Next agent — bd-s9oeu remaining steps, in order (design fixed, do not re-litigate)
+1. **`Agent` (src/agent.rs)**: add fields `iteration_rollover: IterationRolloverMode` (default **Stop** in `Agent::new` ~L1907 so
+   SDK/tests keep legacy behaviour; `tests/agent_loop_reliability.rs:1260` asserts the Error stop) and `iteration_budget_exhausted:
+   bool`; `pub const fn set_iteration_rollover(&mut self, mode)` and `pub fn take_iteration_budget_exhausted(&mut self) -> bool`
+   next to `set_automatic_queue_dispatch` (~L2299). Reset the flag at the top of `run_loop_inner` (~L3196).
+2. **80% warning (~L3579)**: use `budget_warning_text(self.iteration_rollover, …)`. Also fix the skip: do NOT
+   `message_queue.push_steering` (execute_tool_calls drains it before the first batch → every tool "Skipped due to queued user
+   message"); hold it in a local `Option<QueuedAgentMessage>` and `pending_messages.insert(0, w)` right after
+   `steering_after_tools` is consumed (~L3745). That is bd-yrcqj acceptance #3 as well.
+3. **Cap (~L3599)**: when `iteration_rollover == Continue`: strip dangling tool calls as today, but `stop_reason = Stop`,
+   `error_message = None`, push `ContentBlock::Text(budget_checkpoint_marker(max))`, set `iteration_budget_exhausted = true`,
+   emit TurnEnd/AgentEnd with `error: None`, return Ok. `Stop` mode keeps the current error path byte-for-byte.
+4. **`AgentSession`**: field `iteration_rollover_max: u32` (+ setter; default `ITERATION_ROLLOVER_MAX_DEFAULT`). New helper
+   `continue_after_iteration_budget(result, abort, on_event)`: `while result.is_ok() && self.agent.take_iteration_budget_exhausted()`:
+   if `rollovers >= max` → append a `rollover_ceiling_text` as a system-ish note and break; else `rollovers += 1`;
+   `self.maybe_compact(on_event)` (this IS the virtual prompt start — compaction only runs here, see session 12);
+   re-sync `agent.replace_messages(session.to_messages_for_current_path())`; `start_len = agent.messages().len()`; persist a
+   `Message::User(rollover_nudge_text(k, max, cap))` via `append_model_message` + `flush_autosave(Manual)`; wrap run in
+   `extensions_is_streaming` guard; `run_with_messages_with_abort([nudge], abort, …)`; `persist_turn_artifacts(start_len+1, …)`;
+   `finish_turn_persistence`. Call it from the tail of all three `run_agent_with_prompt_message` (~L16088),
+   `run_agent_with_text` (~L16172) and `run_agent_with_content`.
+5. **Wire**: `src/main.rs` ~L2385 and `src/sdk.rs` ~L3024 after constructing the Agent/AgentSession:
+   `agent.set_iteration_rollover(config.iteration_rollover_mode())`, `agent_session.set_iteration_rollover_max(config.iteration_rollover_max())`.
+   `rpc.rs`/`acp.rs` construct their own Agents — same two lines.
+6. **Tests**: agent unit test (scripted provider always returns a tool call, cap 3, Continue → `stop_reason == Stop`, marker text,
+   `take_iteration_budget_exhausted()` true, AgentEnd error None); AgentSession test in `tests/agent_loop_reliability.rs` next to
+   the max-iterations test: with Continue + max 2 → transcript contains `[iteration rollover 1/2]`, `[iteration rollover 2/2]`,
+   then `[iteration rollover ceiling]`, provider called 3× the cap; Stop mode test unchanged.
+7. Docs: settings table (README / docs/configuration) — `iterationRollover`, `iterationRolloverMax`. Then
+   `export PATH="$HOME/.cargo/bin:$PATH"; cargo check --locked --all-targets --keep-going` (30+ min at load ~25), release build in
+   `/tmp/pi-release-wt`, install, live check: `PI_MAX_TOOL_ITERATIONS=3 rpi` with a prompt that needs 6 tool calls → rollover nudge
+   appears, task completes, no error card.
+8. Then **bd-yrcqj** (steer skips tools — items 1,2,4,5), then the Bedrock-stall visibility items (session 12b list), then bd-w85u3.
+
+### Host notes
+- `ubs`, `dsr`, `rch` are NOT installed here; `br` is. Record "static review only" honestly in close reasons.
+- Homebrew cargo shadows rustup: `export PATH="$HOME/.cargo/bin:$PATH"` before any cargo command.
+- Another agent is running `cargo test --lib` in the main checkout; the uncommitted `src/extensions/**`, `src/artifact_output.rs`,
+  `src/providers/bedrock/streaming.rs` are theirs — leave them unstaged.
+- Branch `fix/bedrock-tool-use-type-and-pijs-compat` is ~27 commits ahead of `fork/…` (remote `fork`, no upstream set). Not pushed —
+  push with `git push fork HEAD:fix/bedrock-tool-use-type-and-pijs-compat` once the tree type-checks.
+
+---
+
 ## STATUS UPDATE (session 14, 2026-10-02, iteration-budget handoff)
 
 User asked for "sim tests for card lifecycle" = session-13 step 2 (bd-b6bja live background-work float card).

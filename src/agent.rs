@@ -48,6 +48,10 @@ use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::semantic_workspace_graph::{ContextBundleItem, SemanticContextBundle};
 use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
+use crate::turn_recovery::{
+    ITERATION_ROLLOVER_MAX_DEFAULT, IterationRolloverMode, budget_checkpoint_marker,
+    budget_warning_text, rollover_ceiling_text, rollover_nudge_text,
+};
 use asupersync::runtime::{Runtime, RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::{Mutex, Notify, OwnedMutexGuard};
 use async_trait::async_trait;
@@ -672,18 +676,13 @@ pub const fn should_warn_at_iteration_threshold(current: usize, max: usize) -> b
         && current >= max.saturating_mul(ITERATION_WARN_NUMERATOR) / ITERATION_WARN_DENOMINATOR
 }
 
-/// Body of the one-shot soft-handoff steering message, formatted with the
-/// current/max iteration counts. Kept as a free function so test fixtures
-/// can pin the wording without instantiating a full agent.
+/// Body of the one-shot soft-handoff steering message in the legacy `Stop`
+/// rollover mode, formatted with the current/max iteration counts. Kept as a
+/// free function so test fixtures can pin the wording without instantiating a
+/// full agent; the run loop itself calls [`budget_warning_text`] with the
+/// agent's configured [`IterationRolloverMode`].
 pub fn iteration_handoff_steering_text(current: usize, max: usize) -> String {
-    format!(
-        "[runtime] Tool-iteration budget at >=80% (used {current} of {max}). \
-         Per the iteration-aware-handoff protocol in your spec, begin graceful \
-         handoff now: commit current work, post a one-line status note, and \
-         write an incomplete-handoff envelope with what's done / what remains \
-         / next-agent starting position. Do NOT compress remaining work into \
-         the last few iterations."
-    )
+    budget_warning_text(IterationRolloverMode::Stop, current, max)
 }
 
 /// Configuration for the agent.
@@ -1838,6 +1837,15 @@ pub struct Agent {
     /// Session-scoped secrets vault (bd-cv653.7.9): placeholder map lives in
     /// memory and dies with the session — never persisted raw.
     secrets_vault: crate::secrets::SecretVault,
+
+    /// What the run loop does when `max_tool_iterations` is exhausted
+    /// (bd-s9oeu). `Stop` is the construction default so SDK embedders and
+    /// tests keep the legacy error; the CLI surfaces opt into `Continue`.
+    iteration_rollover: IterationRolloverMode,
+
+    /// Set when the most recent run ended at the iteration cap in `Continue`
+    /// mode; the owning session takes it to decide whether to re-prompt.
+    iteration_budget_exhausted: bool,
 }
 
 /// Activation state for glob-scoped foreign rules (bd-cv653.6.2).
@@ -1929,6 +1937,8 @@ impl Agent {
             magic_keyword_scan_override: None,
             keyword_max_thinking_level,
             secrets_vault: crate::secrets::SecretVault::default(),
+            iteration_rollover: IterationRolloverMode::Stop,
+            iteration_budget_exhausted: false,
         }
     }
 
@@ -2305,6 +2315,28 @@ impl Agent {
             self.automatic_steering_dispatch,
             self.automatic_follow_up_dispatch,
         )
+    }
+
+    /// Choose what happens when a prompt exhausts `max_tool_iterations`
+    /// (bd-s9oeu). `Stop` (the construction default) ends the turn with the
+    /// legacy error; `Continue` ends it cleanly with a checkpoint marker and
+    /// raises the flag read by [`Self::take_iteration_budget_exhausted`].
+    pub const fn set_iteration_rollover(&mut self, mode: IterationRolloverMode) {
+        self.iteration_rollover = mode;
+    }
+
+    #[must_use]
+    pub const fn iteration_rollover(&self) -> IterationRolloverMode {
+        self.iteration_rollover
+    }
+
+    /// Take (and clear) the "last run ended at the iteration cap in `Continue`
+    /// mode" flag. The owning session calls this after each run to decide
+    /// whether to re-prompt with a fresh budget.
+    pub const fn take_iteration_budget_exhausted(&mut self) -> bool {
+        let exhausted = self.iteration_budget_exhausted;
+        self.iteration_budget_exhausted = false;
+        exhausted
     }
 
     /// Explicitly take one configured steering batch without polling fetchers.
@@ -3196,6 +3228,12 @@ impl Agent {
         let mut iterations = 0usize;
         let mut pause_turn_continuations = 0usize;
         let mut warned_at_handoff_threshold = false;
+        // bd-s9oeu: the 80% warning is held here and inserted after the
+        // in-flight tool batch, never pushed onto the steering queue —
+        // `execute_tool_calls` drains that queue before the first call and
+        // would skip every tool as "Skipped due to queued user message".
+        let mut pending_budget_warning: Option<QueuedAgentMessage> = None;
+        self.iteration_budget_exhausted = false;
         let mut turn_index: usize = 0;
         let mut new_messages: Vec<Message> = Vec::with_capacity(prompts.len() + 8);
         let mut last_assistant: Option<Arc<AssistantMessage>> = None;
@@ -3569,13 +3607,13 @@ impl Agent {
                 let mut tool_results: Vec<Arc<ToolResultMessage>> = Vec::new();
                 if execute_local_tools {
                     iterations += 1;
-                    // Soft handoff: at >=80% of the cap, push a one-shot
-                    // steering message so the agent has room to write an
-                    // incomplete-handoff envelope before the hard stop. The
-                    // queue drains at the next loop iteration via
-                    // drain_steering_messages, so the agent observes the
-                    // steering before its next assistant turn rather than
-                    // after the cap fires.
+                    // Soft checkpoint: at >=80% of the cap, hold a one-shot
+                    // steering message and deliver it right after this tool
+                    // batch, so the agent observes it before its next
+                    // assistant turn rather than after the cap fires. Not
+                    // pushed onto the steering queue: execute_tool_calls
+                    // drains that queue before the first call and would skip
+                    // the whole batch as "Skipped due to queued user message".
                     if !warned_at_handoff_threshold
                         && should_warn_at_iteration_threshold(
                             iterations,
@@ -3584,33 +3622,54 @@ impl Agent {
                     {
                         warned_at_handoff_threshold = true;
                         let warning = Message::User(UserMessage {
-                            content: UserContent::Text(iteration_handoff_steering_text(
+                            content: UserContent::Text(budget_warning_text(
+                                self.iteration_rollover,
                                 iterations,
                                 self.config.max_tool_iterations,
                             )),
                             timestamp: Utc::now().timestamp_millis(),
                         });
-                        self.message_queue
-                            .push_steering(QueuedAgentMessage::generated(warning));
+                        pending_budget_warning = Some(QueuedAgentMessage::generated(warning));
                         tracing::warn!(
                             iterations,
                             max = self.config.max_tool_iterations,
-                            "tool-iteration budget at >=80%; injected handoff steering message"
+                            mode = ?self.iteration_rollover,
+                            "tool-iteration budget at >=80%; budget steering message queued after this tool batch"
                         );
                     }
                     if iterations > self.config.max_tool_iterations {
-                        let error_message = format!(
-                            "Maximum tool iterations ({}) exceeded",
-                            self.config.max_tool_iterations
-                        );
+                        let max = self.config.max_tool_iterations;
+                        // bd-s9oeu: in Continue mode the cap is a checkpoint,
+                        // not a failure. The turn ends cleanly with a marker
+                        // and the owning session re-prompts with a fresh
+                        // budget (see AgentSession::continue_after_iteration_budget).
+                        let rollover = self.iteration_rollover == IterationRolloverMode::Continue;
+                        let error_message =
+                            (!rollover).then(|| format!("Maximum tool iterations ({max}) exceeded"));
                         let mut stop_message = (*assistant_arc).clone();
-                        stop_message.stop_reason = StopReason::Error;
-                        stop_message.error_message = Some(error_message.clone());
 
                         // Strip dangling tool calls to prevent sequence mismatch on next user prompt.
                         stop_message
                             .content
                             .retain(|b| !matches!(b, crate::model::ContentBlock::ToolCall(_)));
+
+                        if rollover {
+                            stop_message.stop_reason = StopReason::Stop;
+                            stop_message.error_message = None;
+                            stop_message
+                                .content
+                                .push(crate::model::ContentBlock::Text(TextContent::new(
+                                    budget_checkpoint_marker(max),
+                                )));
+                            self.iteration_budget_exhausted = true;
+                            tracing::info!(
+                                max,
+                                "tool-iteration budget reached; checkpointing for rollover"
+                            );
+                        } else {
+                            stop_message.stop_reason = StopReason::Error;
+                            stop_message.error_message.clone_from(&error_message);
+                        }
 
                         let stop_arc = Arc::new(stop_message.clone());
                         let stop_event_message = Message::Assistant(Arc::clone(&stop_arc));
@@ -3660,7 +3719,7 @@ impl Agent {
                         let agent_end_event = AgentEvent::AgentEnd {
                             session_id: session_id.clone(),
                             messages: std::mem::take(&mut new_messages),
-                            error: Some(error_message),
+                            error: error_message,
                         };
                         self.dispatch_extension_lifecycle_event(&agent_end_event)
                             .await;
@@ -3747,6 +3806,12 @@ impl Agent {
                 } else {
                     // Delivery boundary: after assistant completion (no tool calls).
                     pending_messages = self.drain_steering_messages().await;
+                }
+                // The 80% budget steering lands ahead of anything the user
+                // queued during the batch, so the model reads the runtime
+                // notice before the user's follow-up.
+                if let Some(warning) = pending_budget_warning.take() {
+                    pending_messages.insert(0, warning);
                 }
 
                 // Turn recovery (bd-cv653.3.15): with nothing queued and no

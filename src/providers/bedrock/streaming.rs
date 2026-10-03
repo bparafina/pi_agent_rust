@@ -1372,10 +1372,11 @@ mod tests {
             item,
             Ok(StreamEvent::ToolCallStart { name, .. }) if name == "bash"
         )));
-        assert!(result.iter().any(|item| matches!(
-            item,
-            Ok(StreamEvent::ToolCallEnd { .. })
-        )));
+        assert!(
+            result
+                .iter()
+                .any(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. })))
+        );
     }
 
     #[test]

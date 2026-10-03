@@ -13790,10 +13790,8 @@ async fn build_js_runtime_shards(
                     .await?;
             }
 
-            let snapshot = require_single_shard_snapshot(
-                snapshot_extensions(&runtime).await?,
-                &extension_id,
-            )?;
+            let snapshot =
+                require_single_shard_snapshot(snapshot_extensions(&runtime).await?, &extension_id)?;
             Ok(JsRuntimeShard {
                 extension_id: extension_id.clone(),
                 runtime,

@@ -260,6 +260,28 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_recovery: Option<crate::turn_recovery::TurnRecoveryMode>,
 
+    /// What happens when a prompt exhausts its tool-iteration budget
+    /// (bd-s9oeu): "continue" (default) checkpoints, compacts if needed and
+    /// resumes the same task with a fresh budget; "stop" ends the turn with
+    /// the legacy `Maximum tool iterations exceeded` error.
+    #[serde(
+        default,
+        alias = "iterationRollover",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub iteration_rollover: Option<crate::turn_recovery::IterationRolloverMode>,
+
+    /// Ceiling on automatic rollovers per prompt; after this many the run
+    /// stops for the user. Default
+    /// [`crate::turn_recovery::ITERATION_ROLLOVER_MAX_DEFAULT`]; 0 means stop
+    /// at the first cap (same as `"stop"`).
+    #[serde(
+        default,
+        alias = "iterationRolloverMax",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub iteration_rollover_max: Option<u32>,
+
     // Extension Policy
     #[serde(alias = "extensionPolicy")]
     pub extension_policy: Option<ExtensionPolicyConfig>,
@@ -993,6 +1015,8 @@ impl Config {
             fail_closed_hooks: other.fail_closed_hooks.or(base.fail_closed_hooks),
             compaction_mode: other.compaction_mode.or(base.compaction_mode),
             turn_recovery: other.turn_recovery.or(base.turn_recovery),
+            iteration_rollover: other.iteration_rollover.or(base.iteration_rollover),
+            iteration_rollover_max: other.iteration_rollover_max.or(base.iteration_rollover_max),
 
             // Extension Policy
             extension_policy: merge_extension_policy(base.extension_policy, other.extension_policy),
@@ -1281,6 +1305,23 @@ impl Config {
     #[must_use]
     pub fn turn_recovery_mode(&self) -> crate::turn_recovery::TurnRecoveryMode {
         self.turn_recovery.unwrap_or_default()
+    }
+
+    /// Resolved iteration-budget rollover mode (bd-s9oeu). An explicit
+    /// `iterationRolloverMax` of 0 means "stop at the first cap".
+    #[must_use]
+    pub fn iteration_rollover_mode(&self) -> crate::turn_recovery::IterationRolloverMode {
+        if self.iteration_rollover_max == Some(0) {
+            return crate::turn_recovery::IterationRolloverMode::Stop;
+        }
+        self.iteration_rollover.unwrap_or_default()
+    }
+
+    /// Resolved per-prompt rollover ceiling (bd-s9oeu).
+    #[must_use]
+    pub fn iteration_rollover_max(&self) -> u32 {
+        self.iteration_rollover_max
+            .unwrap_or(crate::turn_recovery::ITERATION_ROLLOVER_MAX_DEFAULT)
     }
 
     pub fn fail_closed_hooks(&self) -> bool {

@@ -317,6 +317,101 @@ impl TurnRecoveryState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Iteration-budget rollover (bd-s9oeu)
+// ---------------------------------------------------------------------------
+//
+// The per-prompt tool-iteration cap used to be a hard wall: at 80% the agent
+// was told to stop and write a handoff document, at 100% the turn ended with
+// an error and a human had to say "keep going". Every roll-over cost the
+// first turns of the next session re-reading that document. With rollover
+// the cap becomes a checkpoint: the turn ends cleanly with a marker, the
+// session compacts if it needs to (the same path a fresh prompt takes), and a
+// generated continue message resumes the same task with a fresh budget — up
+// to a hard per-prompt ceiling so a looping agent still stops.
+
+/// Schema/marker tag carried in rollover messages and logs.
+pub const ITERATION_ROLLOVER_SCHEMA: &str = "pi.iteration_rollover.v1";
+
+/// Default ceiling on automatic rollovers per prompt (settings
+/// `iterationRolloverMax`). 20 × the 50-iteration default budget is 1,000
+/// tool iterations before a human has to weigh in.
+pub const ITERATION_ROLLOVER_MAX_DEFAULT: u32 = 20;
+
+/// What happens when a prompt exhausts its tool-iteration budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IterationRolloverMode {
+    /// Legacy: end the turn with a `Maximum tool iterations exceeded` error
+    /// and leave the next move to the user.
+    Stop,
+    /// Checkpoint and resume: the turn ends cleanly with a budget marker and
+    /// the owning session re-prompts with a fresh budget (compacting first if
+    /// the context calls for it), until [`ITERATION_ROLLOVER_MAX_DEFAULT`] or
+    /// the configured ceiling is reached.
+    #[default]
+    Continue,
+}
+
+/// The one-shot steering text injected at 80% of the budget. In `Continue`
+/// mode it asks for a safe checkpoint, not a handoff document: the run will
+/// resume on its own.
+#[must_use]
+pub fn budget_warning_text(mode: IterationRolloverMode, current: usize, max: usize) -> String {
+    match mode {
+        IterationRolloverMode::Stop => format!(
+            "[runtime] Tool-iteration budget at >=80% (used {current} of {max}). \
+             Per the iteration-aware-handoff protocol in your spec, begin graceful \
+             handoff now: commit current work, post a one-line status note, and \
+             write an incomplete-handoff envelope with what's done / what remains \
+             / next-agent starting position. Do NOT compress remaining work into \
+             the last few iterations."
+        ),
+        IterationRolloverMode::Continue => format!(
+            "[runtime] Tool-iteration budget at >=80% (used {current} of {max}). \
+             The run rolls over automatically with a fresh budget when the cap is \
+             reached; nothing is lost and no handoff document is needed. Reach a \
+             safe checkpoint now — commit or record in-progress state where the \
+             task tracks it — then keep working. Do NOT compress remaining work \
+             into the last few iterations."
+        ),
+    }
+}
+
+/// The text block the agent appends to the assistant message that hit the
+/// cap in `Continue` mode (the counterpart of the `--max-time` marker).
+#[must_use]
+pub fn budget_checkpoint_marker(max: usize) -> String {
+    format!(
+        "[iteration budget reached] {max} tool iterations used; checkpoint — the run \
+         resumes with a fresh budget"
+    )
+}
+
+/// The generated user message that resumes the task after a rollover.
+/// Visible in the transcript and persisted like any user message, so a
+/// replayed session shows exactly where each budget boundary fell.
+#[must_use]
+pub fn rollover_nudge_text(rollover: u32, max_rollovers: u32, budget: usize) -> String {
+    format!(
+        "[iteration rollover {rollover}/{max_rollovers}] The tool-iteration budget was reset \
+         to {budget}. Continue the task from exactly where you stopped: re-issue any tool \
+         calls that were pending, do not repeat work already done, and do not write \
+         handoff documents — progress lives in the transcript and wherever the task \
+         tracks it."
+    )
+}
+
+/// The marker left when the rollover ceiling itself is reached: the next
+/// move is the user's.
+#[must_use]
+pub fn rollover_ceiling_text(max_rollovers: u32, budget: usize) -> String {
+    format!(
+        "[iteration rollover ceiling] {max_rollovers} automatic rollovers of {budget} tool \
+         iterations each have been used on this prompt; stopping for the user to decide."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +671,45 @@ mod tests {
             .expect("actionable");
         assert!(action.nudge_text.contains("auto-continue 1/2"));
         assert!(action.nudge_text.contains("token budget"));
+    }
+
+    #[test]
+    fn iteration_rollover_mode_defaults_to_continue_and_parses_lowercase() {
+        assert_eq!(
+            IterationRolloverMode::default(),
+            IterationRolloverMode::Continue
+        );
+        let parsed: IterationRolloverMode =
+            serde_json::from_str("\"stop\"").expect("stop parses");
+        assert_eq!(parsed, IterationRolloverMode::Stop);
+        let parsed: IterationRolloverMode =
+            serde_json::from_str("\"continue\"").expect("continue parses");
+        assert_eq!(parsed, IterationRolloverMode::Continue);
+        assert!(serde_json::from_str::<IterationRolloverMode>("\"auto\"").is_err());
+    }
+
+    #[test]
+    fn budget_warning_keeps_the_shared_prefix_and_differs_by_mode() {
+        let stop = budget_warning_text(IterationRolloverMode::Stop, 40, 50);
+        let cont = budget_warning_text(IterationRolloverMode::Continue, 40, 50);
+        for text in [&stop, &cont] {
+            assert!(text.contains("Tool-iteration budget at >=80%"));
+            assert!(text.contains("used 40 of 50"));
+        }
+        assert!(stop.contains("incomplete-handoff envelope"));
+        assert!(cont.contains("rolls over automatically"));
+        assert!(cont.contains("no handoff document"));
+    }
+
+    #[test]
+    fn rollover_texts_carry_counters_and_budget() {
+        assert!(budget_checkpoint_marker(50).contains("50 tool iterations used"));
+        let nudge = rollover_nudge_text(3, 20, 50);
+        assert!(nudge.contains("[iteration rollover 3/20]"));
+        assert!(nudge.contains("reset to 50"));
+        assert!(nudge.contains("re-issue any tool calls that were pending"));
+        let ceiling = rollover_ceiling_text(20, 50);
+        assert!(ceiling.contains("20 automatic rollovers"));
+        assert!(ceiling.contains("stopping for the user"));
     }
 }
