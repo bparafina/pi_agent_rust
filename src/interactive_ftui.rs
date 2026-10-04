@@ -4257,7 +4257,7 @@ impl PiFtuiModel {
                      /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
                      /commit [--dry-run], /review [target], /handoff, /approval [mode], \
-                     /advisor [on|off|status], /memory [view|list|search|forget], /hub [id], \
+                     /advisor [status|toggle|on|off], /memory [view|list|search|forget], /hub [id], \
                      /security [paths], /plugins, /open, /reload-plugins, \
                      /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
                      /context, /todo, /jobs, /stats, /help, \

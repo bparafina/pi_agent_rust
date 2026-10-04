@@ -109,7 +109,10 @@ fn dotted_without_digit(value: &str) -> bool {
 /// v4 recognizes quoted assignment keys in JSON/configuration text too.
 /// v5 no longer matches `sk-` keys directly after a letter, so identifiers
 /// such as `task-management-service` are not credentials.
-pub const SECRETS_RULESET_VERSION: u32 = 5;
+/// v6 accepts a literal escape sequence (`\n`, `\t`, `\r`, `\x..`,
+/// `\u....`) as the left boundary, so Debug/JSON-escaped text such as
+/// `"...\nsk-..."` in crash bundles and hub transcripts is still detected.
+pub const SECRETS_RULESET_VERSION: u32 = 6;
 
 /// Token body: `min` or more characters from `class`, with single dots
 /// permitted between characters, ending on a `tail_class` character (the
@@ -130,18 +133,22 @@ fn rules() -> &'static Vec<Rule> {
         // `task-management-service` or an MCP tool `mcp__task-master-ai__x`
         // contain `sk-` mid-word. Group 1 is the key, so `_sk-`, `2sk-` and
         // percent-encoded `%22sk-` are still found (`\b` would miss them).
+        // Debug/JSON escapes put a letter before the key (`\nsk-`, `\tsk-`),
+        // so a literal escape sequence is also accepted as the boundary.
+        const SK_BOUNDARY: &str =
+            r"(?:^|[^A-Za-z]|\\[ntrfv0]|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]{1,6}\})";
         vec![
             // Before `openai-key`: same prefix, tighter shape.
             Rule {
                 name: "anthropic-key",
-                regex: regex::Regex::new(&format!(r"(?:^|[^A-Za-z])(sk-ant-{sk_body})"))
+                regex: regex::Regex::new(&format!(r"{SK_BOUNDARY}(sk-ant-{sk_body})"))
                     .expect("rule"),
                 label: "anthropic_key",
                 reject: None,
             },
             Rule {
                 name: "openai-key",
-                regex: regex::Regex::new(&format!(r"(?:^|[^A-Za-z])(sk-{sk_body})"))
+                regex: regex::Regex::new(&format!(r"{SK_BOUNDARY}(sk-{sk_body})"))
                     .expect("rule"),
                 label: "openai_key",
                 reject: None,
@@ -738,6 +745,37 @@ mod tests {
         let detections = scan("token:sk-0123456789abcdefghijklmn", &[]);
         assert_eq!(detections.len(), 1);
         assert_eq!(detections[0].start, "token:".len());
+    }
+
+    /// Regression (ruleset v6): v5's letter boundary missed keys that follow a
+    /// literal escape sequence, which is exactly how `{:?}`-formatted crash
+    /// bundles and hub transcripts render a newline or tab before a key.
+    #[test]
+    fn sk_rules_match_after_literal_escape_sequences() {
+        // Built at runtime: obviously synthetic, and no key-shaped literal
+        // lives in the source tree.
+        let key = format!("sk-{}", "Q7".repeat(12));
+        let ant = format!("sk-ant-{}", "Z3".repeat(12));
+        for (escaped, expected) in [
+            (format!("\"line one\\n{key}\""), &key),
+            (format!("\\t{key}"), &key),
+            (format!("\\r\\n{key}"), &key),
+            (format!("\\x0a{key}"), &key),
+            (format!("\\u000a{key}"), &key),
+            (format!("\\u{{a}}{key}"), &key),
+            (format!("stderr: \"...\\n{ant}\""), &ant),
+        ] {
+            let detections = scan(&escaped, &[]);
+            assert_eq!(detections.len(), 1, "{escaped}");
+            let found = &escaped[detections[0].start..detections[0].end];
+            assert_eq!(
+                found, expected,
+                "escape prefix must not be captured: {escaped}"
+            );
+        }
+        // The identifier guard still holds: a bare letter is not a boundary.
+        assert!(!contains_secret(&format!("ta{key}"), &[]));
+        assert!(!contains_secret(&format!("n{key}"), &[]));
     }
 
     #[test]

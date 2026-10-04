@@ -878,6 +878,12 @@ fn map_js_error(err: &rquickjs::Error) -> Error {
     Error::extension(format!("QuickJS: {err:?}"))
 }
 
+/// True when a caught QuickJS exception carries no human-readable detail:
+/// empty text, or the coerced literals for `undefined`/`null`.
+fn quickjs_exception_detail_is_empty(detail: &str) -> bool {
+    matches!(detail.trim(), "" | "undefined" | "null")
+}
+
 fn format_quickjs_exception<'js>(ctx: &Ctx<'js>, caught: Value<'js>) -> String {
     if let Ok(obj) = caught.clone().try_into_object()
         && let Some(exception) = Exception::from_object(obj)
@@ -17690,9 +17696,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 .ok();
             if let Some(detail) = detail {
                 let detail = detail.trim();
-                if !detail.is_empty() && detail != "undefined" {
-                    return Error::extension(format!("QuickJS exception: {detail}"));
+                // `ctx.catch()` yields JS `null` when the pending exception was
+                // already consumed (or a handler literally threw null). Neither
+                // 'null' nor 'undefined' is a message; say so instead of
+                // reporting the coerced literal (bd-1pwqs).
+                if quickjs_exception_detail_is_empty(detail) {
+                    return Error::extension(
+                        "QuickJS exception with no detail (the thrown value was null/undefined or already consumed)"
+                            .to_string(),
+                    );
                 }
+                return Error::extension(format!("QuickJS exception: {detail}"));
             }
         }
         map_js_error(err)
@@ -22548,7 +22562,7 @@ function __pi_project_model_entry(raw) {
 	            try {
 	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
 	            } catch (e) {
-		                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, (e && (e.stack || e.message)) || e); } catch (_e) {}
+		                __pi_log_handler_error(eventName, entry.extensionId, e);
 		                continue;
 		            }
 	            if (result && typeof result === 'object') {
@@ -22600,7 +22614,7 @@ function __pi_project_model_entry(raw) {
 	            try {
 	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
 	            } catch (e) {
-		                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, (e && (e.stack || e.message)) || e); } catch (_e) {}
+		                __pi_log_handler_error(eventName, entry.extensionId, e);
 		                continue;
 		            }
 	            if (result && typeof result === 'object') {
@@ -22653,7 +22667,7 @@ function __pi_project_model_entry(raw) {
 	            try {
 	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event_payload, ctx));
 	            } catch (e) {
-	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, (e && (e.stack || e.message)) || e); } catch (_e) {}
+	                __pi_log_handler_error(eventName, entry.extensionId, e);
 	                continue;
 	            }
 	            if (!result || typeof result !== 'object') continue;
@@ -22689,7 +22703,7 @@ function __pi_project_model_entry(raw) {
 	            try {
 	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
 	            } catch (e) {
-	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, (e && (e.stack || e.message)) || e); } catch (_e) {}
+	                __pi_log_handler_error(eventName, entry.extensionId, e);
 	                continue;
 	            }
 	            if (result === undefined || result === null) {
@@ -22715,9 +22729,9 @@ function __pi_project_model_entry(raw) {
 	        try {
 	            value = await __pi_with_extension_async(entry.extensionId, () => handler(event_payload, ctx));
 	        } catch (e) {
-	            try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, (e && (e.stack || e.message)) || e); } catch (_e) {}
+	            __pi_log_handler_error(eventName, entry.extensionId, e);
 	            if (eventName === 'tool_call' || eventName.startsWith('session_before_')) {
-	                throw e;
+	                throw __pi_wrap_handler_error(e, eventName, entry.extensionId);
 	            }
 	            continue;
 	        }
@@ -22740,6 +22754,49 @@ function __pi_project_model_entry(raw) {
     }
     return last;
 }
+
+	// Best-effort rendering of whatever a handler threw. QuickJS `Error.stack`
+	// omits the name/message line (unlike V8), so logging only `e.stack` lost
+	// the message entirely (bd-1pwqs). Non-Error throwables (null, undefined,
+	// plain objects) are described instead of being coerced to 'null'.
+	function __pi_format_handler_error(e) {
+	    if (e === null) return 'threw null (no error detail)';
+	    if (e === undefined) return 'threw undefined (no error detail)';
+	    if (typeof e !== 'object' && typeof e !== 'function') return String(e);
+	    const name = typeof e.name === 'string' && e.name ? e.name : '';
+	    const message = typeof e.message === 'string' ? e.message : '';
+	    const stack = typeof e.stack === 'string' ? e.stack.trim() : '';
+	    let head = name && message ? name + ': ' + message : (name || message);
+	    if (!head) {
+	        try {
+	            const json = JSON.stringify(e);
+	            head = json && json !== '{}' ? 'threw non-Error value ' + json : 'threw ' + Object.prototype.toString.call(e) + ' (no error detail)';
+	        } catch (_e) {
+	            head = 'threw non-Error value (unserializable)';
+	        }
+	    }
+	    return stack ? head + '\n' + stack : head;
+	}
+
+	// Wraps a handler failure that must propagate to the host so the user sees
+	// WHICH extension and event failed, never a bare 'QuickJS exception: null'.
+	function __pi_wrap_handler_error(e, eventName, extensionId) {
+	    const detail = __pi_format_handler_error(e);
+	    const wrapped = new Error('Extension error in ' + String(extensionId) + ' (' + String(eventName) + '): ' + detail.split('\n')[0]);
+	    if (e && typeof e === 'object' && typeof e.stack === 'string' && e.stack) {
+	        try { wrapped.stack = e.stack; } catch (_e) {}
+	    }
+	    try { wrapped.cause = e; } catch (_e) {}
+	    return wrapped;
+	}
+
+	function __pi_log_handler_error(eventName, extensionId, e) {
+	    try {
+	        if (globalThis.console && globalThis.console.error) {
+	            globalThis.console.error('Event handler error:', eventName, extensionId, __pi_format_handler_error(e));
+	        }
+	    } catch (_e) {}
+	}
 
 	async function __pi_dispatch_extension_event(event_name, event_payload, ctx_payload) {
 	    const eventName = String(event_name || '').trim();
@@ -22817,7 +22874,7 @@ function __pi_project_model_entry(raw) {
 	            const value = await __pi_dispatch_event_inner(eventName, entry.event_payload, ctx);
 	            results.push({ event: eventName, ok: true, value: value });
 	        } catch (e) {
-	            results.push({ event: eventName, ok: false, error: String(e) });
+	            results.push({ event: eventName, ok: false, error: __pi_format_handler_error(e) });
 	        }
 	    }
 	    return results;
@@ -25222,7 +25279,7 @@ if (typeof globalThis.setTimeout !== 'function') {
                 ? __pi_with_extension_async(captured_id, invoke)
                 : Promise.resolve().then(invoke);
             result.catch((e) => {
-                console.error('setTimeout callback error:', e);
+                console.error('setTimeout callback error:', captured_id || '(no extension)', __pi_format_handler_error(e));
             });
         });
         return timer_id;
@@ -25600,6 +25657,7 @@ for (const [name, fn] of Object.entries({
     __pi_event_batch_context_delete,
     __pi_dispatch_extension_event_phase_in_batch,
     __pi_dispatch_extension_events_batch,
+    __pi_format_handler_error,
     __pi_task_start,
     __pi_task_poll,
     __pi_task_take,
@@ -31053,6 +31111,94 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 "Handler C should run after A crashes"
             );
         });
+    }
+
+    /// bd-1pwqs: a handler that throws a non-Error value (null/undefined/{})
+    /// must be reported with the extension id, the event name and a
+    /// best-effort detail — never as the bare literal 'null'.
+    #[test]
+    fn pijs_handler_throwing_non_error_values_is_reported_with_extension_and_event() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    globalThis.wrapped = {};
+                    globalThis.formatted = {
+                        nul: __pi_format_handler_error(__pi_test_secret, null),
+                        undef: __pi_format_handler_error(__pi_test_secret, undefined),
+                        empty: __pi_format_handler_error(__pi_test_secret, {}),
+                        plain: __pi_format_handler_error(__pi_test_secret, { code: 7 }),
+                        err: __pi_format_handler_error(__pi_test_secret, new TypeError("bad thing")),
+                        str: __pi_format_handler_error(__pi_test_secret, "just a string"),
+                    };
+
+                    // tool_call rethrows handler failures to the host; that is
+                    // the path that used to surface 'QuickJS exception: null'.
+                    __pi_begin_extension(__pi_test_secret, "ext.null", { name: "ext.null" });
+                    pi.events.on("tool_call", (_p, _c) => { throw null; });
+                    __pi_end_extension(__pi_test_secret);
+
+                    (async () => {
+                        try {
+                            await __pi_dispatch_extension_event(__pi_test_secret, "tool_call", {}, {});
+                            globalThis.wrapped.threw = false;
+                        } catch (e) {
+                            globalThis.wrapped.threw = true;
+                            globalThis.wrapped.message = String(e && e.message);
+                            globalThis.wrapped.causeIsNull = (e && e.cause === null);
+                        }
+                    })();
+                "#,
+                ))
+                .await
+                .expect("eval");
+
+            let formatted = get_global_json(&runtime, "formatted").await;
+            assert_eq!(formatted["nul"], "threw null (no error detail)");
+            assert_eq!(formatted["undef"], "threw undefined (no error detail)");
+            assert_eq!(
+                formatted["empty"],
+                "threw [object Object] (no error detail)"
+            );
+            assert_eq!(formatted["plain"], "threw non-Error value {\"code\":7}");
+            assert_eq!(formatted["str"], "just a string");
+            let err = formatted["err"].as_str().expect("string");
+            assert!(
+                err.starts_with("TypeError: bad thing"),
+                "name + message must lead the detail, got {err:?}"
+            );
+
+            let wrapped = get_global_json(&runtime, "wrapped").await;
+            assert_eq!(wrapped["threw"], serde_json::Value::Bool(true));
+            let message = wrapped["message"].as_str().expect("string");
+            assert!(
+                message.starts_with("Extension error in ext.null (tool_call): threw null"),
+                "got {message:?}"
+            );
+            assert!(!message.contains("QuickJS exception: null"));
+            assert_eq!(wrapped["causeIsNull"], serde_json::Value::Bool(true));
+        });
+    }
+
+    #[test]
+    fn quickjs_exception_detail_literals_are_treated_as_empty() {
+        for detail in ["", "  ", "undefined", "null", " null "] {
+            assert!(
+                quickjs_exception_detail_is_empty(detail),
+                "{detail:?} carries no detail"
+            );
+        }
+        for detail in ["null pointer", "Error: null", "TypeError: x is undefined"] {
+            assert!(
+                !quickjs_exception_detail_is_empty(detail),
+                "{detail:?} is a real message"
+            );
+        }
     }
 
     #[test]

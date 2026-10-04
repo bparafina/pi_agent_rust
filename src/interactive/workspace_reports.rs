@@ -437,7 +437,9 @@ fn format_roster(roster: &[crate::agent_hub::ChildEntry]) -> Report {
     )
 }
 
-/// OMP `/advisor [toggle|on|off|status]`: bare toggles. `configured` is the
+/// `/advisor [status|toggle|on|off]`: the bare form reports status, exactly
+/// like `/approval`; changing state needs an explicit `toggle`, `on` or
+/// `off` (a status check must never flip the advisor). `configured` is the
 /// advisor role's model spec, when one is assigned. `pause`/`resume` stay
 /// accepted as aliases of `off`/`on`.
 pub fn advisor(configured: Option<&str>, args: &str) -> Report {
@@ -451,10 +453,10 @@ fn advisor_with(
 ) -> Report {
     use std::sync::atomic::Ordering;
     let enable = match args.trim().to_ascii_lowercase().as_str() {
-        "" | "toggle" => paused.load(Ordering::SeqCst),
+        "toggle" => paused.load(Ordering::SeqCst),
         "on" | "resume" => true,
         "off" | "pause" => false,
-        "status" => {
+        "" | "status" => {
             return Report::status(match (configured, paused.load(Ordering::SeqCst)) {
                 (Some(spec), false) => format!("Advisor: on ({spec})"),
                 (Some(spec), true) => format!("Advisor: off ({spec} assigned)"),
@@ -463,7 +465,7 @@ fn advisor_with(
         }
         other => {
             return Report::status(format!(
-                "Unknown /advisor subcommand {other:?}: use /advisor [on|off|status]"
+                "Unknown /advisor subcommand {other:?}: use /advisor [status|toggle|on|off]"
             ));
         }
     };
@@ -620,16 +622,39 @@ mod tests {
         assert!(hub("no-such-child-9").status.contains("unknown child"));
     }
 
-    /// OMP semantics: bare `/advisor` toggles; on/off are idempotent; the
-    /// reply says when no advisor model is assigned.
+    /// Bare `/advisor` is a status check and must not flip state (a user
+    /// checking whether the advisor is on used to switch it off); `toggle`
+    /// flips; on/off are idempotent; the reply says when no advisor model is
+    /// assigned.
     #[test]
     fn advisor_toggles_and_reports_a_missing_model() {
         let paused = std::sync::atomic::AtomicBool::new(false);
         let spec = Some("anthropic/claude-haiku-4-5");
         let paused_now = || paused.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(advisor_with(&paused, spec, "").status, "Advisor disabled.");
+        assert_eq!(
+            advisor_with(&paused, spec, "").status,
+            "Advisor: on (anthropic/claude-haiku-4-5)"
+        );
+        assert!(!paused_now(), "bare /advisor is read-only");
+        assert_eq!(
+            advisor_with(&paused, spec, "  ").status,
+            "Advisor: on (anthropic/claude-haiku-4-5)"
+        );
+        assert!(!paused_now(), "whitespace-only args are still the bare form");
+        assert_eq!(
+            advisor_with(&paused, spec, "toggle").status,
+            "Advisor disabled."
+        );
         assert!(paused_now());
-        assert_eq!(advisor_with(&paused, spec, "").status, "Advisor enabled.");
+        assert_eq!(
+            advisor_with(&paused, spec, "").status,
+            "Advisor: off (anthropic/claude-haiku-4-5 assigned)"
+        );
+        assert!(paused_now(), "bare /advisor is read-only when off too");
+        assert_eq!(
+            advisor_with(&paused, spec, "toggle").status,
+            "Advisor enabled."
+        );
         assert!(!paused_now());
         assert_eq!(advisor_with(&paused, spec, "on").status, "Advisor enabled.");
         assert!(!paused_now(), "on is idempotent");
