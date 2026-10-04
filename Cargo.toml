@@ -517,6 +517,13 @@ tui = [
 # runtime is ported. Requires `tui` because the bridge reuses PiMsg and the
 # existing agent-event plumbing during coexistence.
 ftui = ["dep:ftui", "dep:ftui-extras", "tui"]
+# Animated status-line effects on the ftui stack (bd-7u3jw). Opt-in. Measured
+# on 71d5b93f8, release profile, nightly-2026-08-31, arm64 macOS:
+#   link cost alone (feature on, no call site):  -32 B, startup noise
+#   USE cost (delight::shimmer_spans call site):  +16560 B (+0.045%),
+#     startup p50 8.80 -> 8.83 ms interleaved n=60 (noise); 13.1 MiB headroom
+#     under the 48 MiB budget.
+ftui-fx = ["ftui", "ftui-extras/text-effects"]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
 wasm-host = ["dep:wasmtime"]

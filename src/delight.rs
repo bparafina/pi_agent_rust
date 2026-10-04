@@ -154,6 +154,50 @@ impl FireworksState {
     }
 }
 
+/// Shimmer-sweep a status label into per-character spans (feature `ftui-fx`).
+///
+/// Each character's brightness comes from [`compute_shimmer_intensity`] and is
+/// eased, then mapped between `base` and `peak` in OkLab so the sweep reads as
+/// a uniform brightening rather than a hue shift. `tick` is caller-supplied
+/// (the spinner frame), never wall-clock, so frames are deterministic under
+/// snapshot tests. Consecutive characters that resolve to the same color share
+/// a span to keep the span count close to the number of distinct shades.
+#[cfg(feature = "ftui-fx")]
+#[must_use]
+pub fn shimmer_spans(
+    text: &str,
+    tick: u64,
+    mode: ShimmerMode,
+    base: ftui::PackedRgba,
+    peak: ftui::PackedRgba,
+) -> Vec<ftui::text::Span<'static>> {
+    use ftui_extras::text_effects::{Easing, lerp_color_oklab};
+
+    let mut spans: Vec<ftui::text::Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_color: Option<ftui::PackedRgba> = None;
+    for (idx, ch) in text.chars().enumerate() {
+        let intensity = f64::from(compute_shimmer_intensity(idx, tick, mode));
+        let color = lerp_color_oklab(base, peak, Easing::EaseInOut.apply(intensity));
+        if run_color.is_some_and(|current| current != color) {
+            let finished = std::mem::take(&mut run);
+            spans.push(ftui::text::Span::styled(
+                finished,
+                ftui::Style::new().fg(run_color.take().unwrap_or(base)),
+            ));
+        }
+        run_color = Some(color);
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(ftui::text::Span::styled(
+            run,
+            ftui::Style::new().fg(run_color.unwrap_or(base)),
+        ));
+    }
+    spans
+}
+
 /// Format OSC 0 / OSC 2 terminal window title escape sequence.
 #[must_use]
 pub fn format_terminal_title(title: &str) -> String {
@@ -225,5 +269,39 @@ mod tests {
     fn test_terminal_title_has_a_bounded_payload() {
         let seq = format_terminal_title(&"x".repeat(300));
         assert_eq!(seq, format!("\x1b]0;{}\x07", "x".repeat(256)));
+    }
+
+    /// bd-7u3jw: the shimmer must preserve the label text exactly, be a pure
+    /// function of `tick` (snapshot-stable), and actually move between ticks.
+    #[cfg(feature = "ftui-fx")]
+    #[test]
+    fn test_shimmer_spans_round_trip_and_tick_driven() {
+        let base = ftui::PackedRgba::rgb(0x60, 0x60, 0x60);
+        let peak = ftui::PackedRgba::rgb(0xff, 0xd7, 0x00);
+        let label = "⠋ responding ...";
+
+        let joined = |spans: &[ftui::text::Span<'static>]| -> String {
+            spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+
+        let a = shimmer_spans(label, 0, ShimmerMode::Cosine, base, peak);
+        let a_again = shimmer_spans(label, 0, ShimmerMode::Cosine, base, peak);
+        let b = shimmer_spans(label, 6, ShimmerMode::Cosine, base, peak);
+
+        assert_eq!(joined(&a), label, "span text must round-trip the label");
+        assert_eq!(joined(&b), label);
+        assert!(a.len() <= label.chars().count(), "runs must be merged, not one span per char");
+        assert!(a.len() > 1, "a sweep must produce more than one shade");
+
+        let colors = |spans: &[ftui::text::Span<'static>]| -> Vec<Option<ftui::PackedRgba>> {
+            spans.iter().map(|s| s.style.fg).collect()
+        };
+        assert_eq!(colors(&a), colors(&a_again), "same tick must render identically");
+        assert!(
+            a.len() != b.len() || colors(&a) != colors(&b),
+            "advancing the tick must move the sweep"
+        );
+
+        assert!(shimmer_spans("", 3, ShimmerMode::Kitt, base, peak).is_empty());
     }
 }
