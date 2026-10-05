@@ -294,7 +294,7 @@ mod tests {
         assert!(a.len() > 1, "a sweep must produce more than one shade");
 
         let colors = |spans: &[ftui::text::Span<'static>]| -> Vec<Option<ftui::PackedRgba>> {
-            spans.iter().map(|s| s.style.fg).collect()
+            spans.iter().map(|s| s.style.and_then(|st| st.fg)).collect()
         };
         assert_eq!(colors(&a), colors(&a_again), "same tick must render identically");
         assert!(
