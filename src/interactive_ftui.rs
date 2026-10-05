@@ -4868,6 +4868,37 @@ impl PiFtuiModel {
         self.busy.as_ref().map(|op| op.label.as_str())
     }
 
+    /// Push the status-region label as spans. While the agent is working the
+    /// `ftui-fx` build shimmer-sweeps the label (bd-7u3jw) using the spinner
+    /// frame as the clock, so the sweep advances exactly when the spinner does
+    /// and stops with it; every other state, and every non-`ftui-fx` build,
+    /// pushes the single styled span the status line has always been.
+    fn push_status_spans(
+        &self,
+        spans: &mut Vec<ftui::text::Span<'static>>,
+        status_line: String,
+        status_style: ftui::Style,
+    ) {
+        #[cfg(feature = "ftui-fx")]
+        if self.state == AgentUiState::Working {
+            // ~1.5 label chars per 120ms spinner tick: a full sweep across a
+            // typical `⠋ responding ...` label in about a second.
+            const SHIMMER_TICKS_PER_FRAME: u64 = 6;
+            let tick = u64::try_from(self.spinner.current_frame)
+                .unwrap_or(0)
+                .wrapping_mul(SHIMMER_TICKS_PER_FRAME);
+            spans.extend(crate::delight::shimmer_spans(
+                &status_line,
+                tick,
+                crate::delight::ShimmerMode::Cosine,
+                self.palette.muted,
+                self.palette.warning,
+            ));
+            return;
+        }
+        spans.push(ftui::text::Span::styled(status_line, status_style));
+    }
+
     /// Carry out an extension UI effect, reporting whether it was handled.
     ///
     /// `false` leaves the caller to fall back to printing the request, which
@@ -6209,7 +6240,7 @@ impl PiFtuiModel {
             };
             let mut spans = Vec::new();
             if !status_line.is_empty() {
-                spans.push(ftui::text::Span::styled(status_line, status_style));
+                self.push_status_spans(&mut spans, status_line, status_style);
             }
             if !powerline.is_empty() {
                 if !spans.is_empty() {
