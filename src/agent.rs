@@ -49,8 +49,8 @@ use crate::semantic_workspace_graph::{ContextBundleItem, SemanticContextBundle};
 use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
 use crate::turn_recovery::{
-    ITERATION_ROLLOVER_MAX_DEFAULT, IterationRolloverMode, budget_checkpoint_marker,
-    budget_warning_text, rollover_ceiling_text, rollover_nudge_text,
+    ITERATION_ROLLOVER_MAX_DEFAULT, ITERATION_ROLLOVER_SCHEMA, IterationRolloverMode,
+    budget_checkpoint_marker, budget_warning_text, rollover_ceiling_text, rollover_nudge_text,
 };
 use asupersync::runtime::{Runtime, RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::{Mutex, Notify, OwnedMutexGuard};
@@ -2330,6 +2330,12 @@ impl Agent {
         self.iteration_rollover
     }
 
+    /// The per-prompt tool-iteration budget this agent runs with.
+    #[must_use]
+    pub const fn max_tool_iterations(&self) -> usize {
+        self.config.max_tool_iterations
+    }
+
     /// Take (and clear) the "last run ended at the iteration cap in `Continue`
     /// mode" flag. The owning session calls this after each run to decide
     /// whether to re-prompt with a fresh budget.
@@ -3241,9 +3247,9 @@ impl Agent {
         let mut pause_turn_continuations = 0usize;
         let mut warned_at_handoff_threshold = false;
         // bd-s9oeu: the 80% warning is held here and inserted after the
-        // in-flight tool batch, never pushed onto the steering queue —
-        // `execute_tool_calls` drains that queue before the first call and
-        // would skip every tool as "Skipped due to queued user message".
+        // in-flight tool batch, never pushed onto the steering queue, to
+        // keep it ordered ahead of anything the user queues mid-batch
+        // rather than racing it through the same delivery boundary.
         let mut pending_budget_warning: Option<QueuedAgentMessage> = None;
         self.iteration_budget_exhausted = false;
         let mut turn_index: usize = 0;
@@ -3623,9 +3629,9 @@ impl Agent {
                     // steering message and deliver it right after this tool
                     // batch, so the agent observes it before its next
                     // assistant turn rather than after the cap fires. Not
-                    // pushed onto the steering queue: execute_tool_calls
-                    // drains that queue before the first call and would skip
-                    // the whole batch as "Skipped due to queued user message".
+                    // pushed onto the steering queue: that queue is drained
+                    // once execute_tool_calls finishes the whole batch, so
+                    // this stays ordered ahead of anything the user queues.
                     if !warned_at_handoff_threshold
                         && should_warn_at_iteration_threshold(
                             iterations,
@@ -5065,12 +5071,6 @@ impl Agent {
                 break;
             }
 
-            let steering = self.drain_steering_messages().await;
-            if !steering.is_empty() {
-                steering_messages = Some(steering);
-                break;
-            }
-
             let batch_len = effect_batch.end.saturating_sub(effect_batch.start);
             let batch = tool_calls
                 .iter()
@@ -5104,30 +5104,21 @@ impl Agent {
         }
 
         // Imported scoped rules (bd-cv653.6.2): activation is decided from
-        // the tool calls' path inputs AFTER the batches ran (queuing earlier
-        // would trip the steering check above and skip the tools). Newly
-        // activated rules ride the steering queue, so the model sees them
-        // alongside these tool results, before its next request.
+        // the tool calls' path inputs AFTER the batches ran. Newly activated
+        // rules ride the steering queue, so the model sees them alongside
+        // these tool results, before its next request.
         self.activate_scoped_rules_for_tool_calls(tool_calls);
 
-        // Phase 3: Process results sequentially and handle skips.
+        // Phase 3: Process results sequentially. Tool calls are never
+        // skipped because the user spoke mid-batch (OMP semantics, bd-yrcqj):
+        // a queued user message is only delivered after every tool call from
+        // the current assistant turn has run and its result is recorded. The
+        // only way a tool call here lacks a recorded result is an abort.
         for (index, tool_call) in tool_calls.iter().enumerate() {
-            // Check for new steering if we haven't already found some.
-            // This catches steering messages that arrived during the *last* tool's execution.
-            if steering_messages.is_none() && !abort.as_ref().is_some_and(AbortSignal::is_aborted) {
-                let steering = self.drain_steering_messages().await;
-                if !steering.is_empty() {
-                    steering_messages = Some(steering);
-                }
-            }
-
             // If a result was recorded during execution, keep outcome ordering
             // without re-emitting lifecycle events or duplicating transcript entries.
             if let Some(tool_result) = recorded_results.get_mut(index).and_then(Option::take) {
                 results.push(tool_result);
-            } else if steering_messages.is_some() {
-                // Skipped due to steering.
-                results.push(self.skip_tool_call(tool_call, &on_event, new_messages));
             } else {
                 // Aborted or otherwise failed to run (e.g. abort signal).
                 let output = ToolOutput {
@@ -5182,6 +5173,18 @@ impl Agent {
                 on_event(AgentEvent::MessageEnd { message: end_msg });
 
                 results.push(tool_result);
+            }
+        }
+
+        // Delivery boundary (OMP semantics, bd-yrcqj): drain exactly once,
+        // after every tool call from this assistant turn has run and its
+        // result recorded, never before or between them. The run loop's
+        // `steering_after_tools` path delivers this ahead of the next
+        // provider request, with these tool results already in `self.messages`.
+        if !abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+            let steering = self.drain_steering_messages().await;
+            if !steering.is_empty() {
+                steering_messages = Some(steering);
             }
         }
 
@@ -5874,56 +5877,6 @@ impl Agent {
             Err(err) => tracing::warn!("tool_result extension hook failed (fail-open): {err}"),
         }
     }
-
-    fn skip_tool_call(
-        &mut self,
-        tool_call: &ToolCall,
-        on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
-        new_messages: &mut Vec<Message>,
-    ) -> Arc<ToolResultMessage> {
-        let output = ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(
-                "Skipped due to queued user message.",
-            ))],
-            details: None,
-            is_error: true,
-        };
-
-        // Note: Phase 1 already emitted ToolExecutionStart for all tools,
-        // so we only emit Update and End here.
-        on_event(AgentEvent::ToolExecutionUpdate {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
-            args: tool_call.arguments.clone(),
-            partial_result: output.clone(),
-        });
-        on_event(AgentEvent::ToolExecutionEnd {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
-            result: output.clone(),
-            is_error: true,
-        });
-
-        let tool_result = Arc::new(ToolResultMessage {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
-            content: output.content,
-            details: output.details,
-            is_error: true,
-            timestamp: Utc::now().timestamp_millis(),
-        });
-
-        let msg = Message::ToolResult(Arc::clone(&tool_result));
-        self.messages.push(msg.clone());
-        new_messages.push(msg.clone());
-
-        on_event(AgentEvent::MessageStart {
-            message: msg.clone(),
-        });
-        on_event(AgentEvent::MessageEnd { message: msg });
-
-        tool_result
-    }
 }
 
 // ============================================================================
@@ -6035,6 +5988,10 @@ pub struct AgentSession {
     /// replacement. The generation rejects an action that began before a
     /// replacement but only acquired the permit after the replacement.
     session_action_admission: SessionActionAdmissionGate,
+    /// Ceiling on automatic iteration-budget rollovers per prompt
+    /// (bd-s9oeu, settings `iterationRolloverMax`). Only consulted when the
+    /// agent runs in [`IterationRolloverMode::Continue`].
+    iteration_rollover_max: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -8086,6 +8043,117 @@ mod extensions_integration_tests {
         }
     }
 
+    /// bd-yrcqj: same shape as `ToolUseProvider` but issues three
+    /// `count_tool` calls in its first turn, so a steer fired while tool 1
+    /// is in flight has two more queued tool calls behind it to prove are
+    /// not skipped.
+    #[derive(Debug)]
+    struct ThreeToolUseProvider {
+        stream_calls: AtomicUsize,
+    }
+
+    impl ThreeToolUseProvider {
+        const fn new() -> Self {
+            Self {
+                stream_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn assistant_message(
+            &self,
+            stop_reason: StopReason,
+            content: Vec<ContentBlock>,
+        ) -> AssistantMessage {
+            AssistantMessage {
+                content,
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for ThreeToolUseProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call_index = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+
+            let partial = self.assistant_message(StopReason::Stop, Vec::new());
+
+            let (reason, message) = if call_index == 0 {
+                let tool_calls = vec![
+                    ToolCall {
+                        id: "call-1".to_string(),
+                        name: "count_tool".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    },
+                    ToolCall {
+                        id: "call-2".to_string(),
+                        name: "count_tool".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    },
+                    ToolCall {
+                        id: "call-3".to_string(),
+                        name: "count_tool".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    },
+                ];
+
+                (
+                    StopReason::ToolUse,
+                    self.assistant_message(
+                        StopReason::ToolUse,
+                        tool_calls
+                            .into_iter()
+                            .map(ContentBlock::ToolCall)
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+            } else {
+                (
+                    StopReason::Stop,
+                    self.assistant_message(
+                        StopReason::Stop,
+                        vec![ContentBlock::Text(TextContent::new("done"))],
+                    ),
+                )
+            };
+
+            let events = vec![
+                Ok(StreamEvent::Start { partial }),
+                Ok(StreamEvent::Done { reason, message }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
     #[test]
     fn agent_session_enable_extensions_registers_extension_tools() {
         let runtime = RuntimeBuilder::current_thread()
@@ -9771,7 +9839,11 @@ mod extensions_integration_tests {
     }
 
     #[test]
-    fn send_user_message_steer_skips_remaining_tools() {
+    fn send_user_message_steer_does_not_skip_remaining_tools() {
+        // OMP semantics (bd-yrcqj): a steer message typed mid-batch is
+        // queued, not a rollback. Every tool call from the assistant's
+        // current turn still runs; the steer is delivered at the next
+        // model boundary, after all tool results are recorded.
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -9820,8 +9892,150 @@ mod extensions_integration_tests {
                 .await
                 .expect("run_text");
 
-            // A steer message should short-circuit remaining tool dispatch.
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            // ToolUseProvider issues two "count_tool" calls in its first
+            // turn; a steer fired while the first is in flight must not
+            // cancel the second.
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+            let messages = agent_session.agent.messages();
+            let last_tool_result_index = messages
+                .iter()
+                .rposition(|m| matches!(m, Message::ToolResult(_)))
+                .expect("a tool result was recorded");
+            let steer_index = messages
+                .iter()
+                .position(|m| {
+                    matches!(m, Message::User(user)
+                        if matches!(&user.content, crate::model::UserContent::Text(text)
+                            if text.contains("steer-now")))
+                })
+                .expect("steer message delivered");
+            assert!(
+                steer_index > last_tool_result_index,
+                "steer message must land after all tool results, got steer_index={steer_index} last_tool_result_index={last_tool_result_index}"
+            );
+            assert!(
+                !messages.iter().any(|m| matches!(m, Message::ToolResult(result)
+                    if result.content.iter().any(|block| matches!(block, ContentBlock::Text(text)
+                        if text.text.contains("Skipped"))))),
+                "no tool result should be skipped due to a queued steer message"
+            );
+        });
+    }
+
+    /// bd-yrcqj acceptance #2: a steer typed while tool 1 of a 3-call batch
+    /// is in flight must not roll back tools 2 and 3. All three tool calls
+    /// run to completion and their results are recorded before the steer is
+    /// delivered as the next turn's leading user message.
+    #[test]
+    fn steer_mid_batch_does_not_skip_later_tools_in_three_call_batch() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  let sent = false;
+                  pi.on("tool_call", async (event) => {
+                    if (sent) return {};
+                    if (Object.is(event && event.toolName, "count_tool")) {
+                      sent = true;
+                      await pi.events("sendUserMessage", {
+                        text: "steer-mid-batch",
+                        options: { deliverAs: "steer" }
+                      });
+                    }
+                    return {};
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(ThreeToolUseProvider::new());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let _ = agent_session
+                .run_text("go".to_string(), |_| {})
+                .await
+                .expect("run_text");
+
+            // All three queued tool calls ran, despite the steer firing
+            // while the first was in flight.
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+            let messages = agent_session.agent.messages();
+            let tool_result_indices: Vec<usize> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| matches!(m, Message::ToolResult(_)))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(
+                tool_result_indices.len(),
+                3,
+                "all three tool calls must produce a recorded result"
+            );
+            for index in &tool_result_indices {
+                let Message::ToolResult(result) = &messages[*index] else {
+                    unreachable!("filtered to ToolResult above")
+                };
+                assert!(!result.is_error, "tool result must not be an error");
+                assert!(
+                    !result
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Text(text)
+                            if text.text.contains("Skipped"))),
+                    "tool result content must not contain 'Skipped'"
+                );
+            }
+
+            let last_tool_result_index = *tool_result_indices
+                .iter()
+                .max()
+                .expect("at least one tool result");
+            let steer_index = messages
+                .iter()
+                .position(|m| {
+                    matches!(m, Message::User(user)
+                        if matches!(&user.content, crate::model::UserContent::Text(text)
+                            if text.contains("steer-mid-batch")))
+                })
+                .expect("steer message delivered");
+            assert!(
+                steer_index > last_tool_result_index,
+                "steer message must land after the last tool result"
+            );
+            let next_assistant_index = messages
+                .iter()
+                .enumerate()
+                .skip(steer_index + 1)
+                .find(|(_, m)| matches!(m, Message::Assistant(_)))
+                .map(|(index, _)| index);
+            if let Some(next_assistant_index) = next_assistant_index {
+                assert!(
+                    next_assistant_index > steer_index,
+                    "the next assistant message must follow the steer message"
+                );
+            }
         });
     }
 
@@ -12841,11 +13055,31 @@ impl AgentSession {
             semantic_context_bundle: None,
             provider_admission: ProviderAdmissionGate::default(),
             session_action_admission: SessionActionAdmissionGate::default(),
+            iteration_rollover_max: ITERATION_ROLLOVER_MAX_DEFAULT,
         }
     }
 
     pub const fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;
+    }
+
+    /// Configure what happens when a prompt exhausts its tool-iteration
+    /// budget (bd-s9oeu): the agent's rollover mode plus the per-prompt
+    /// ceiling on automatic rollovers. `max == 0` is the same as `Stop`.
+    pub const fn set_iteration_rollover(&mut self, mode: IterationRolloverMode, max: u32) {
+        let mode = if max == 0 {
+            IterationRolloverMode::Stop
+        } else {
+            mode
+        };
+        self.agent.set_iteration_rollover(mode);
+        self.iteration_rollover_max = max;
+    }
+
+    /// The configured ceiling on automatic iteration-budget rollovers.
+    #[must_use]
+    pub const fn iteration_rollover_max(&self) -> u32 {
+        self.iteration_rollover_max
     }
 
     /// Attach the MCP client registry that serves this session so its turn
@@ -16098,6 +16332,127 @@ impl AgentSession {
         result
     }
 
+    /// bd-s9oeu: resume a prompt whose run ended at the tool-iteration cap in
+    /// [`IterationRolloverMode::Continue`].
+    ///
+    /// Each rollover is a fresh agent run on the same session path: compact
+    /// if the context calls for it, re-sync history, persist a generated
+    /// user nudge (visible in the transcript, so a replay shows exactly where
+    /// each budget boundary fell), run again with a fresh budget, persist the
+    /// turn artifacts. Loops while runs keep ending at the cap, up to
+    /// [`Self::iteration_rollover_max`]; at the ceiling a displayed
+    /// `pi.iteration_rollover.v1` Custom entry is persisted and the last
+    /// checkpointed assistant message is returned, so the next move is the
+    /// user's. An abort between runs ends the loop without a nudge.
+    ///
+    /// In `Stop` mode the flag is never raised and this returns `result`
+    /// untouched.
+    async fn continue_after_iteration_budget(
+        &mut self,
+        mut result: Result<AssistantMessage>,
+        abort: Option<AbortSignal>,
+        on_event: AgentEventHandler,
+    ) -> Result<AssistantMessage> {
+        let mut rollovers: u32 = 0;
+        while result.is_ok() && self.agent.take_iteration_budget_exhausted() {
+            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                tracing::info!(rollovers, "iteration rollover skipped: run aborted");
+                break;
+            }
+            let budget = self.agent.max_tool_iterations();
+            let max_rollovers = self.iteration_rollover_max;
+            if rollovers >= max_rollovers {
+                let ceiling = Message::Custom(CustomMessage {
+                    content: rollover_ceiling_text(max_rollovers, budget),
+                    custom_type: ITERATION_ROLLOVER_SCHEMA.to_string(),
+                    display: true,
+                    details: Some(json!({
+                        "event": "ceiling",
+                        "rollovers": rollovers,
+                        "maxRollovers": max_rollovers,
+                        "budget": budget,
+                    })),
+                    timestamp: Utc::now().timestamp_millis(),
+                });
+                {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+                        .await
+                        .map_err(|e| Error::session(e.to_string()))?;
+                    session.append_model_message(ceiling.clone());
+                    if self.save_enabled {
+                        session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
+                    }
+                }
+                on_event(AgentEvent::MessageStart {
+                    message: ceiling.clone(),
+                });
+                on_event(AgentEvent::MessageEnd { message: ceiling });
+                tracing::warn!(
+                    rollovers,
+                    max_rollovers,
+                    budget,
+                    "iteration rollover ceiling reached; stopping for the user"
+                );
+                break;
+            }
+            rollovers += 1;
+            tracing::info!(
+                rollover = rollovers,
+                max_rollovers,
+                budget,
+                "tool-iteration budget exhausted; rolling over with a fresh budget"
+            );
+
+            self.maybe_compact(Arc::clone(&on_event)).await?;
+            let history = {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let session = self
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .map_err(|e| Error::session(e.to_string()))?;
+                session.to_messages_for_current_path()
+            };
+            self.agent.replace_messages(history);
+            let start_len = self.agent.messages().len();
+
+            let nudge = Message::User(UserMessage {
+                content: UserContent::Text(rollover_nudge_text(rollovers, max_rollovers, budget)),
+                timestamp: Utc::now().timestamp_millis(),
+            });
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+                    .await
+                    .map_err(|e| Error::session(e.to_string()))?;
+                session.append_model_message(nudge.clone());
+                if self.save_enabled {
+                    session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
+                }
+            }
+
+            let streaming_guard = AtomicBoolGuard::activate(&self.extensions_is_streaming);
+            let on_event_for_run = Arc::clone(&on_event);
+            let run = self
+                .agent
+                .run_with_messages_with_abort(vec![nudge], abort.clone(), move |event| {
+                    on_event_for_run(event);
+                })
+                .await;
+            drop(streaming_guard);
+
+            let run_incomplete = run.as_ref().map_or(true, |message| {
+                matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+            });
+            let persist_result = self
+                .persist_turn_artifacts(start_len + 1, run.is_err(), run_incomplete)
+                .await;
+            result = finish_turn_persistence(run, persist_result);
+        }
+        result
+    }
+
     async fn run_agent_with_prompt_message(
         &mut self,
         prompt_message: Message,
@@ -16154,7 +16509,7 @@ impl AgentSession {
         prompts.extend(semantic_context_messages);
         let result = self
             .agent
-            .run_with_messages_with_abort(prompts, abort, move |event| {
+            .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
                 on_event_for_run(event);
             })
             .await;
@@ -16168,7 +16523,9 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        let result = finish_turn_persistence(result, persist_result);
+        self.continue_after_iteration_budget(result, abort, on_event)
+            .await
     }
 
     pub(crate) async fn run_agent_with_text(
@@ -16236,7 +16593,7 @@ impl AgentSession {
         let on_event_for_run = Arc::clone(&on_event);
         let result = self
             .agent
-            .run_with_messages_with_abort(prompts, abort, move |event| {
+            .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
                 on_event_for_run(event);
             })
             .await;
@@ -16252,7 +16609,9 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        let result = finish_turn_persistence(result, persist_result);
+        self.continue_after_iteration_budget(result, abort, on_event)
+            .await
     }
 
     pub(crate) async fn run_agent_with_content(
@@ -16320,7 +16679,7 @@ impl AgentSession {
         let on_event_for_run = Arc::clone(&on_event);
         let result = self
             .agent
-            .run_with_messages_with_abort(prompts, abort, move |event| {
+            .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
                 on_event_for_run(event);
             })
             .await;
@@ -16336,7 +16695,9 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        finish_turn_persistence(result, persist_result)
+        let result = finish_turn_persistence(result, persist_result);
+        self.continue_after_iteration_budget(result, abort, on_event)
+            .await
     }
 
     /// Resume the current turn after a transient failure WITHOUT adding a new

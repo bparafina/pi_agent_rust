@@ -1,5 +1,62 @@
 # Handoff — rpi native "pretty" cards, freeze fix, Bedrock fixes (2026-09-30)
 
+## STATUS UPDATE (session 17, 2026-10-05, iteration-budget handoff)
+
+Resumed **bd-s9oeu** from the session-16 plan. Verified steps 1–3 are on disk in `src/agent.rs` (they were in the
+working tree but NOT in commit `270f6fbd5`, which only carried the handoff doc). **Step 4 is now written** in
+`src/agent.rs` and committed in this handoff commit. Type-check status: a `cargo check --locked --lib` was started
+against the *pre-step-4* tree and had not finished when the budget fired — **nothing in this commit is type-checked**.
+
+Host notes: `dsr`, `ubs`, `rg` are absent. Homebrew `cargo` (stable 1.96) shadows the rustup proxy and fails on the
+`-Z` flags; the pinned `nightly-2026-08-31` IS installed — **always `export PATH="$HOME/.cargo/bin:$PATH"` first**.
+
+### Done this session (bd-s9oeu step 4, `src/agent.rs`)
+- Import `ITERATION_ROLLOVER_SCHEMA` added to the `crate::turn_recovery` use (~L51).
+- `Agent::max_tool_iterations()` const accessor (~L2335), next to `iteration_rollover()`.
+- `AgentSession` field `iteration_rollover_max: u32` (default `ITERATION_ROLLOVER_MAX_DEFAULT` in `new`, ~L13058);
+  `AgentSession::set_iteration_rollover(mode, max)` — one setter that sets the agent's mode AND the ceiling, and
+  coerces `max == 0` to `Stop` (~L13069); `iteration_rollover_max()` getter.
+- `AgentSession::continue_after_iteration_budget(result, abort, on_event)` (~L16350): the loop from the session-16
+  plan verbatim — ceiling persists a displayed `Message::Custom` (`custom_type = pi.iteration_rollover.v1`,
+  `details = {event:"ceiling", rollovers, maxRollovers, budget}`) + MessageStart/MessageEnd, then breaks;
+  otherwise `maybe_compact` → re-sync history → persist `rollover_nudge_text` user message → streaming guard →
+  `run_with_messages_with_abort(vec![nudge], abort.clone(), …)` → `persist_turn_artifacts(start_len+1, …)` →
+  `finish_turn_persistence`. Aborted-between-runs breaks without a nudge.
+- Wired as the tail of `run_agent_with_prompt_message`, `run_agent_with_text`, `run_agent_with_content`
+  (`abort.clone()` into the run; `self.continue_after_iteration_budget(result, abort, on_event).await`).
+- **Deliberately NOT wired** into `run_continue_with_abort` (the retry-resume path, ~L16710): a retry re-enters the
+  same turn; whether a cap hit during a retried turn should roll over is an open question — decide, then wire or
+  document. Default lean: wire it the same way (the flag is only raised in Continue mode, so Stop mode is unaffected).
+
+### Next agent — remaining steps, in order
+5. **Wire the config** (the setter exists; nobody calls it yet, so the default is still `Stop` everywhere):
+   - `src/sdk.rs` ~L3020 right after `AgentSession::new(...)`/`with_runtime_handle`:
+     `agent_session.set_iteration_rollover(config.iteration_rollover_mode(), config.iteration_rollover_max());`
+     (`config` is in scope — same block that calls `set_queue_modes`). This covers the default FTUI and embedders.
+   - `src/main.rs` ~L2383 (classic path, `config` in scope): same line after `set_api_key_override`.
+   - `src/acp.rs` ~L1561: same, if a `Config` is in scope there; otherwise leave on `Stop` and note it.
+   - RPC: check whether `rpc.rs` production sessions come from `main.rs`/`sdk.rs` (the ~60 `AgentSession::new`
+     hits in rpc.rs are almost all tests). Also consider a `max_tool_iterations`-style CLI/env override only if
+     cheap; settings.json (`iterationRollover`, `iterationRolloverMax`) is the contract.
+6. **Type-check**: `export PATH="$HOME/.cargo/bin:$PATH"; cargo check --locked --all-targets --keep-going
+   --message-format short`. Expect: unused-import warnings if step 5 is skipped (`ITERATION_ROLLOVER_MAX_DEFAULT`
+   is now used; `rollover_*_text`/`SCHEMA` are used). Then clippy `--all-targets -- -D warnings` (pedantic/nursery
+   on this pin — `const fn` with `if` is fine on nightly; `map_or(true, …)` mirrors existing code).
+7. **Tests** (in `src/agent.rs` tests mod, next to the ~L19400 `iteration_handoff_steering_text` pin): a fake
+   provider that always emits a tool call; `max_tool_iterations = 2`; `Continue` with `max = 1` → assert session
+   path contains: user prompt, assistant w/ `budget_checkpoint_marker`, user `rollover_nudge_text(1,1,2)`,
+   assistant w/ marker, Custom `pi.iteration_rollover.v1`; and `Stop` → legacy `Maximum tool iterations (2)
+   exceeded` error, no nudge. Plus `max = 0` ⇒ Stop via the setter.
+8. Docs: one paragraph in the README session/settings section (`iterationRollover: "stop"|"continue"`,
+   `iterationRolloverMax`, default continue/20). Then release build + live `PI_MAX_TOOL_ITERATIONS=3 rpi` check,
+   close bd-s9oeu with the evidence, then bd-yrcqj, Bedrock-stall items, bd-w85u3.
+
+### Working-tree note
+`src/interactive_ftui.rs` (bd-w85u3 tick-chain parking), `src/providers/anthropic.rs`, `Cargo.lock` carry other
+sessions' uncommitted work — left untouched and NOT in this commit.
+
+---
+
 ## STATUS UPDATE (session 16, 2026-10-02, iteration-budget handoff)
 
 Resumed **bd-s9oeu** from the session-15 plan. Session 15's `turn_recovery.rs`/`config.rs` groundwork was on disk but had
