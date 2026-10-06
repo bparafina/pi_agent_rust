@@ -3032,6 +3032,14 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // whatever was configured. Extensions enabled below copy these modes.
     agent_session.set_queue_modes(config.steering_queue_mode(), config.follow_up_queue_mode());
     agent_session.set_api_key_override(options.api_key.clone());
+    // settings.json `iterationRollover` / `iterationRolloverMax` (bd-s9oeu):
+    // exhausting the tool-iteration budget rolls the prompt over with a fresh
+    // budget instead of ending the turn with an error. The default FTUI and
+    // every embedder build through here, so this is where the setting lands.
+    agent_session.set_iteration_rollover(
+        config.iteration_rollover_mode(),
+        config.iteration_rollover_max(),
+    );
     agent_session.advisor = options
         .advisor
         .as_ref()

@@ -2390,6 +2390,13 @@ async fn run(
     )
     .with_runtime_handle(runtime_handle.clone());
     agent_session.set_api_key_override(cli.api_key.clone());
+    // settings.json `iterationRollover` / `iterationRolloverMax` (bd-s9oeu):
+    // exhausting the tool-iteration budget rolls the prompt over with a fresh
+    // budget instead of ending the turn with an error.
+    agent_session.set_iteration_rollover(
+        config.iteration_rollover_mode(),
+        config.iteration_rollover_max(),
+    );
     if foreign_rules.scoped_rules().next().is_some() {
         agent_session
             .agent

@@ -4,8 +4,8 @@
 
 Resumed **bd-s9oeu** from the session-16 plan. Verified steps 1–3 are on disk in `src/agent.rs` (they were in the
 working tree but NOT in commit `270f6fbd5`, which only carried the handoff doc). **Step 4 is now written** in
-`src/agent.rs` and committed in this handoff commit. Type-check status: a `cargo check --locked --lib` was started
-against the *pre-step-4* tree and had not finished when the budget fired — **nothing in this commit is type-checked**.
+`src/agent.rs` and committed in this handoff commit. Type-check status: **steps 4+5 pass `cargo check --locked --lib --bins`**
+(nightly-2026-08-31, exit 0, no new warnings). Clippy `--all-targets -D warnings` and tests NOT yet run.
 
 Host notes: `dsr`, `ubs`, `rg` are absent. Homebrew `cargo` (stable 1.96) shadows the rustup proxy and fails on the
 `-Z` flags; the pinned `nightly-2026-08-31` IS installed — **always `export PATH="$HOME/.cargo/bin:$PATH"` first**.
@@ -29,12 +29,9 @@ Host notes: `dsr`, `ubs`, `rg` are absent. Homebrew `cargo` (stable 1.96) shadow
   document. Default lean: wire it the same way (the flag is only raised in Continue mode, so Stop mode is unaffected).
 
 ### Next agent — remaining steps, in order
-5. **Wire the config** (the setter exists; nobody calls it yet, so the default is still `Stop` everywhere):
-   - `src/sdk.rs` ~L3020 right after `AgentSession::new(...)`/`with_runtime_handle`:
-     `agent_session.set_iteration_rollover(config.iteration_rollover_mode(), config.iteration_rollover_max());`
-     (`config` is in scope — same block that calls `set_queue_modes`). This covers the default FTUI and embedders.
-   - `src/main.rs` ~L2383 (classic path, `config` in scope): same line after `set_api_key_override`.
-   - `src/acp.rs` ~L1561: same, if a `Config` is in scope there; otherwise leave on `Stop` and note it.
+5. **Config wiring DONE** for `src/sdk.rs` (~L3035, after `set_api_key_override`; default FTUI + embedders) and
+   `src/main.rs` (~L2393, classic path). Still open:
+   - `src/acp.rs` ~L1561: same call if a `Config` is in scope there; otherwise leave on `Stop` and note it.
    - RPC: check whether `rpc.rs` production sessions come from `main.rs`/`sdk.rs` (the ~60 `AgentSession::new`
      hits in rpc.rs are almost all tests). Also consider a `max_tool_iterations`-style CLI/env override only if
      cheap; settings.json (`iterationRollover`, `iterationRolloverMax`) is the contract.
